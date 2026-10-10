@@ -1,7 +1,7 @@
 """
 Streamlit Web Application for Worksheet Cleaner.
-Mobile-first UI to upload photos, remove pen answers directly from the images,
-and generate a clean printable PDF of the cleaned page images.
+Mobile-first UI to upload photos, regenerate clean worksheet images using
+Gemini Image models (Nano Banana / Flash Image), and compile them into a PDF.
 """
 
 import streamlit as st
@@ -39,20 +39,20 @@ cleaner = get_cleaner()
 
 def main():
     st.title("📝 Worksheet Cleaner")
-    st.markdown("Erase pen answers from school booklet photos — get back the exact clean page images in a PDF.")
+    st.markdown("Regenerate clean assignment images without answers — upload photos, get a clean printable PDF.")
 
     # Sidebar
     st.sidebar.header("⚙️ Settings")
 
     cleaning_engine = st.sidebar.radio(
         "Cleaning Engine",
-        ["🌟 Gemini AI Eraser (Recommended)", "🎨 Local OpenCV Filter (Offline)"],
-        help="Gemini AI detects exact handwriting coordinates and erases only the answers while keeping the original page image intact."
+        ["🌟 AI Image Regeneration (Nano Banana / Flash-Image)", "🎨 Local OpenCV Filter (Offline)"],
+        help="Gemini Image models take your photo and regenerate the exact clean worksheet image with answers erased."
     )
 
     api_key = ""
     chosen_model = ""
-    if "Gemini AI" in cleaning_engine:
+    if "AI Image Regeneration" in cleaning_engine:
         default_key = os.environ.get("GEMINI_API_KEY", "")
         if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
             default_key = st.secrets["GEMINI_API_KEY"]
@@ -68,34 +68,27 @@ def main():
             unsafe_allow_html=True
         )
 
-        default_models = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
-        available_models = default_models
-
-        if api_key.strip():
-            fetched = cleaner.get_available_models(api_key)
-            if fetched:
-                available_models = fetched
+        image_models = cleaner.get_available_image_models(api_key)
 
         chosen_model = st.sidebar.selectbox(
-            "AI Model",
-            options=available_models,
+            "Image Generation Model",
+            options=image_models,
             index=0,
-            help="Flash-Lite is ultra-fast, lightweight, and generous with limits."
+            help="gemini-3.1-flash-lite-image is ultra-fast with high free-tier limits. Nano Banana Pro offers maximum precision."
         )
 
-        with st.sidebar.expander("📊 Model Tiers & Free Limits"):
+        with st.sidebar.expander("ℹ️ Model Details & Quotas"):
             st.markdown(
                 """
-                **⚡ Gemini 3.1 Flash-Lite (Recommended):**
-                - **Speed:** Fastest latency (~1s per image)
-                - **Limit:** ~15–30 Requests/Min, ~1,500+ Requests/Day
-                - **Cost:** 100% Free
-                
-                **🚀 Gemini 2.5 / 3.8 Flash:**
-                - Standard high-capacity multimodal model.
-                
-                **🧠 Gemini 2.5 / 3.0 Pro:**
-                - Deep reasoning for very messy or faint handwriting (~2–5 RPM).
+                **⚡ `gemini-3.1-flash-lite-image`:**
+                - High-speed, high-quota image generation model.
+                - Best for multi-page batch booklet cleaning.
+
+                **🍌 `gemini-3.1-flash-image` (Nano Banana 2):**
+                - Standard balanced multimodal image model.
+
+                **🧠 `gemini-3-pro-image` (Nano Banana Pro):**
+                - Maximum fidelity for complex typography and tables.
                 """
             )
 
@@ -124,8 +117,8 @@ def main():
     if uploaded_files:
         st.caption(f"📁 {len(uploaded_files)} image(s) selected")
 
-        if st.button("🧹 Clean & Generate PDF", type="primary", use_container_width=True):
-            if "Gemini AI" in cleaning_engine and not api_key.strip():
+        if st.button("🧹 Regenerate Clean Pages & PDF", type="primary", use_container_width=True):
+            if "AI Image Regeneration" in cleaning_engine and not api_key.strip():
                 st.error("⚠️ Please enter your Gemini API Key in the sidebar to use AI mode. It's completely free from Google AI Studio!")
                 return
 
@@ -136,10 +129,9 @@ def main():
             for i, file in enumerate(uploaded_files):
                 file_bytes = file.getvalue()
 
-                # Process depending on engine
-                if "Gemini AI" in cleaning_engine:
-                    status_text.text(f"🤖 AI erasing answers from image {i+1} of {len(uploaded_files)} using {chosen_model}...")
-                    cleaned_bgr, msg = cleaner.clean_image_with_gemini_ai(file_bytes, api_key, chosen_model=chosen_model)
+                if "AI Image Regeneration" in cleaning_engine:
+                    status_text.text(f"🎨 Regenerating clean image {i+1} of {len(uploaded_files)} using {chosen_model}...")
+                    cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
                 else:
                     status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
                     cleaned_bgr, msg = cleaner.process_image(file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance)
@@ -155,18 +147,18 @@ def main():
 
                 # Show Side-by-Side Image Preview
                 if show_preview:
-                    st.markdown(f"**Preview: {file.name}**")
+                    st.markdown(f"**Page {i+1}: {file.name}**")
                     col1, col2 = st.columns([1, 1])
                     with col1:
-                        st.image(file_bytes, caption="Original Photo", use_container_width=True)
+                        st.image(file_bytes, caption="Original Uploaded Photo", use_container_width=True)
                     with col2:
                         cleaned_rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
-                        st.image(cleaned_rgb, caption="Cleaned Image (Answers Erased)", use_container_width=True)
+                        st.image(cleaned_rgb, caption="✨ AI-Regenerated Clean Image", use_container_width=True)
 
                 progress_bar.progress((i + 1) / len(uploaded_files))
 
             if processed_images:
-                status_text.text("✨ Compiling cleaned page images into PDF...")
+                status_text.text("📄 Assembling clean images into printable PDF...")
                 pdf_bytes = cleaner.images_to_pdf(processed_images)
 
                 st.success("✅ Clean PDF ready for download!")
@@ -184,7 +176,7 @@ def main():
     st.markdown(
         """
         <div style='text-align: center; color: gray; font-size: 0.85em;'>
-            💡 <strong>How it works:</strong> The AI precisely locates handwritten pen marks and erases them directly from your photos, preserving the original booklet layout, typography, and page numbers.
+            💡 <strong>Image Regeneration:</strong> Takes your solved booklet photo and regenerates a clean digital image with all answers removed, ready to print!
         </div>
         """,
         unsafe_allow_html=True

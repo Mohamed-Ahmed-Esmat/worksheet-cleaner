@@ -1,9 +1,11 @@
 """
 Core image processing logic for Worksheet Cleaner.
 Supports:
-1. AI Image Eraser: Uses Gemini Vision to detect exact coordinates of handwritten answers,
-   then inpaints/erases them directly from the original image, returning the exact cleaned page.
-2. Local OpenCV Eraser: Traditional color thresholding for clean scans.
+1. Native Gemini Image Regeneration (Nano Banana / Flash Image):
+   Uses Gemini's native image-to-image multimodal generation to REGENERATE
+   the exact worksheet image cleanly without the handwritten answers.
+2. AI Bounding Box Inpainting (Fallback).
+3. Local OpenCV Filter (Offline).
 """
 
 import cv2
@@ -12,6 +14,7 @@ from PIL import Image
 import io
 import re
 import json
+import base64
 from typing import List, Tuple, Optional
 
 
@@ -22,48 +25,46 @@ class WorksheetCleaner:
         self.default_blue_upper = np.array([130, 255, 255])
 
     # ---------------------------------------------------------
-    # GEMINI AI IMAGE ERASER (IMAGE IN -> CLEANED IMAGE OUT)
+    # 1. NATIVE GEMINI IMAGE REGENERATION (NANO BANANA / FLASH-IMAGE)
     # ---------------------------------------------------------
-    def get_available_models(self, api_key: str) -> List[str]:
+    def get_available_image_models(self, api_key: str) -> List[str]:
         """
-        Dynamically queries Google AI Studio for models available to this API key.
+        Dynamically finds available Gemini Image models (Nano Banana / Flash Image family).
         """
+        preferred = [
+            "gemini-3.1-flash-lite-image",
+            "gemini-3.1-flash-image",
+            "gemini-nano-banana-2.1",
+            "gemini-3-pro-image",
+        ]
+
         if not api_key or not api_key.strip():
-            return []
+            return preferred
 
         try:
             from google import genai
             client = genai.Client(api_key=api_key.strip())
             all_models = client.models.list()
-            
             supported = []
             for m in all_models:
                 name = getattr(m, 'name', str(m)).replace("models/", "")
-                if "gemini" in name and not any(x in name for x in ["embedding", "aqa", "imagen"]):
+                if any(x in name for x in ["image", "banana", "nano"]):
                     supported.append(name)
 
-            def score_model(m):
-                score = 0
-                if "3.1-flash-lite" in m or "lite" in m: score += 150
-                if "flash" in m: score += 100
-                if "pro" in m: score += 90
-                if "3." in m: score += 30
-                if "2.5" in m: score += 20
-                if "2.0" in m: score += 10
-                return -score
-
-            supported.sort(key=score_model)
-            return supported
+            if supported:
+                return supported
         except Exception:
-            return ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
+            pass
 
-    def clean_image_with_gemini_ai(
+        return preferred
+
+    def regenerate_image_with_ai(
         self, img_bytes: bytes, api_key: str, chosen_model: Optional[str] = None
     ) -> Tuple[Optional[np.ndarray], str]:
         """
-        Uses Gemini Vision to locate student handwriting/answers on the page,
-        then precisely in-paints and erases them from the ORIGINAL IMAGE.
-        Returns the cleaned image (BGR numpy array) and status message.
+        Calls Gemini Image Generation (Nano Banana / Flash-Image) to take the
+        worksheet photo and directly REGENERATE the clean page image with all
+        answers cleanly removed.
         """
         try:
             from google import genai
@@ -71,125 +72,134 @@ class WorksheetCleaner:
         except ImportError:
             return None, "Error: google-genai library is not installed."
 
-        # Decode original image
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return None, "Error: Could not decode image."
-
-        img = self.resize_if_large(img)
-        h, w = img.shape[:2]
+        client = genai.Client(api_key=api_key.strip())
 
         prompt = (
-            "You are an expert document analysis AI.\n"
-            "Analyze this photo of a school workbook/worksheet page.\n"
-            "Detect ALL student handwriting, handwritten answers, filled-in table cells, pen scribbles, and written solutions.\n"
-            "CRITICAL: Do NOT detect printed typography, printed questions, printed headers, or table lines.\n\n"
-            "Return a JSON array of 2D bounding boxes enclosing each handwritten answer, normalized from 0 to 1000:\n"
-            "[\n"
-            '  {"box_2d": [ymin, xmin, ymax, xmax], "label": "handwriting"}\n'
-            "]\n"
-            "Output ONLY the raw JSON array. No explanations or markdown."
+            "Clean and regenerate this school worksheet page image.\n"
+            "Keep the exact same page layout, printed typography, tables, and questions.\n"
+            "Completely remove and erase all student handwritten answers, pen markings, and notes.\n"
+            "Leave the answer blanks and table cells clean and empty so a student can re-practice.\n"
+            "Output the clean worksheet as an image."
         )
 
-        try:
-            client = genai.Client(api_key=api_key.strip())
-            
-            models_to_try = []
-            if chosen_model and chosen_model.strip():
-                models_to_try.append(chosen_model.strip())
-            
-            available = self.get_available_models(api_key)
-            for m in available:
-                if m not in models_to_try:
-                    models_to_try.append(m)
+        models_to_try = []
+        if chosen_model and chosen_model.strip():
+            models_to_try.append(chosen_model.strip())
 
-            if not models_to_try:
-                models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
+        defaults = [
+            "gemini-3.1-flash-lite-image",
+            "gemini-3.1-flash-image",
+            "gemini-nano-banana-2.1",
+            "gemini-3-pro-image",
+        ]
+        for m in defaults:
+            if m not in models_to_try:
+                models_to_try.append(m)
 
-            boxes = []
-            used_model = ""
-            last_error = ""
+        last_error = ""
 
-            for model_name in models_to_try:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                            prompt,
-                        ]
+        # Attempt 1: Direct native image regeneration
+        for model_name in models_to_try:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"]
                     )
-                    if response and response.text:
-                        raw_text = response.text.strip()
-                        # Extract JSON array
-                        match = re.search(r'\[\s*\{.*\}\s*\]', raw_text, re.DOTALL)
-                        if match:
-                            try:
-                                boxes = json.loads(match.group(0))
-                            except Exception:
-                                pass
-                        
-                        if not boxes:
-                            # Fallback regex for [ymin, xmin, ymax, xmax]
-                            nums = re.findall(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', raw_text)
-                            for n in nums:
-                                boxes.append({"box_2d": [int(x) for x in n]})
+                )
 
-                        used_model = model_name
-                        break
-                except Exception as e:
-                    last_error = str(e)
-                    continue
+                if response and response.candidates:
+                    for part in response.candidates[0].content.parts:
+                        if getattr(part, 'inline_data', None):
+                            raw_data = part.inline_data.data
+                            if isinstance(raw_data, str):
+                                raw_bytes = base64.b64decode(raw_data)
+                            else:
+                                raw_bytes = raw_data
 
-            if not boxes and not used_model:
-                return None, f"Gemini API error: {last_error}"
+                            nparr = np.frombuffer(raw_bytes, np.uint8)
+                            cleaned_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                            if cleaned_bgr is not None:
+                                return cleaned_bgr, f"Successfully regenerated using {model_name}"
 
-            # Inpaint the detected handwriting directly on the original image
-            cleaned_img = self.inpaint_boxes(img, boxes)
-            msg = f"Cleaned {len(boxes)} handwritten areas using {used_model}"
-            return cleaned_img, msg
+            except Exception as e:
+                last_error = f"{model_name}: {str(e)}"
+                continue
 
+        # Attempt 2: If image generation modality isn't supported on current key,
+        # fallback to high-precision coordinate inpainting
+        fallback_img, fallback_msg = self.fallback_coordinate_inpaint(img_bytes, client)
+        if fallback_img is not None:
+            return fallback_img, f"Regenerated via AI Inpainting (image model fallback: {last_error})"
+
+        return None, f"Image regeneration failed: {last_error}"
+
+    def fallback_coordinate_inpaint(self, img_bytes: bytes, client) -> Tuple[Optional[np.ndarray], str]:
+        """
+        Fallback inpainting using multimodal coordinate detection.
+        """
+        try:
+            from google.genai import types
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return None, "Decode error"
+
+            img = self.resize_if_large(img)
+            h, w = img.shape[:2]
+
+            prompt = (
+                "Detect all handwritten text, student answers, and pen markings in this image. "
+                "Do NOT detect printed text or table grids. "
+                "Return a JSON array of bounding boxes normalized from 0 to 1000: "
+                '[{"box_2d": [ymin, xmin, ymax, xmax]}]'
+            )
+
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                    prompt,
+                ]
+            )
+
+            raw_text = response.text if response else ""
+            boxes = []
+            nums = re.findall(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', raw_text)
+            for n in nums:
+                boxes.append({"box_2d": [int(x) for x in n]})
+
+            mask = np.zeros((h, w), dtype=np.uint8)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            for b in boxes:
+                box = b.get("box_2d", [])
+                if len(box) == 4:
+                    y1 = max(0, int(box[0] * h / 1000.0))
+                    x1 = max(0, int(box[1] * w / 1000.0))
+                    y2 = min(h, int(box[2] * h / 1000.0))
+                    x2 = min(w, int(box[3] * w / 1000.0))
+                    if y2 > y1 and x2 > x1:
+                        roi = gray[y1:y2, x1:x2]
+                        pval = np.percentile(roi, 80)
+                        smask = (roi < (pval - 20)).astype(np.uint8) * 255
+                        kernel = np.ones((3, 3), np.uint8)
+                        smask = cv2.dilate(smask, kernel, iterations=1)
+                        mask[y1:y2, x1:x2] = cv2.bitwise_or(mask[y1:y2, x1:x2], smask)
+
+            if cv2.countNonZero(mask) > 0:
+                cleaned = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
+                return cleaned, "Cleaned via coordinate inpainting"
+            return img, "No handwriting detected"
         except Exception as e:
-            return None, f"Failed to process with Gemini: {str(e)}"
-
-    def inpaint_boxes(self, img: np.ndarray, boxes: List[dict]) -> np.ndarray:
-        """
-        Creates a stroke mask inside the AI-detected bounding boxes and erases the handwriting.
-        """
-        h, w = img.shape[:2]
-        mask = np.zeros((h, w), dtype=np.uint8)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        for item in boxes:
-            box = item.get("box_2d", [])
-            if len(box) == 4:
-                ymin, xmin, ymax, xmax = box
-                y1 = max(0, int(ymin * h / 1000.0))
-                x1 = max(0, int(xmin * w / 1000.0))
-                y2 = min(h, int(ymax * h / 1000.0))
-                x2 = min(w, int(xmax * w / 1000.0))
-
-                if y2 > y1 and x2 > x1:
-                    roi_gray = gray[y1:y2, x1:x2]
-                    # Estimate local paper brightness
-                    paper_val = np.percentile(roi_gray, 80)
-                    
-                    # Target ink strokes that are darker than the local paper
-                    stroke_mask = roi_gray < (paper_val - 20)
-                    kernel = np.ones((3, 3), np.uint8)
-                    stroke_uint8 = (stroke_mask.astype(np.uint8)) * 255
-                    stroke_uint8 = cv2.dilate(stroke_uint8, kernel, iterations=1)
-
-                    mask[y1:y2, x1:x2] = cv2.bitwise_or(mask[y1:y2, x1:x2], stroke_uint8)
-
-        if cv2.countNonZero(mask) > 0:
-            cleaned = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
-            return cleaned
-        return img
+            return None, str(e)
 
     # ---------------------------------------------------------
-    # OPENCV LOCAL PROCESSING (FALLBACK / OFFLINE)
+    # 2. LOCAL OPENCV PROCESSING (OFFLINE)
     # ---------------------------------------------------------
     def enhance_image(self, img: np.ndarray) -> np.ndarray:
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -277,9 +287,6 @@ class WorksheetCleaner:
             return None, f"Error processing image: {str(e)}"
 
     def images_to_pdf(self, images_bgr: List[np.ndarray]) -> bytes:
-        """
-        Converts a list of BGR numpy images into a multi-page PDF using Pillow.
-        """
         pil_images = []
         for img_bgr in images_bgr:
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
