@@ -23,7 +23,44 @@ class WorksheetCleaner:
     # ---------------------------------------------------------
     # GEMINI AI PROCESSING
     # ---------------------------------------------------------
-    def clean_with_gemini(self, img_bytes: bytes, api_key: str) -> Tuple[Optional[str], str]:
+    def get_available_models(self, api_key: str) -> List[str]:
+        """
+        Dynamically queries Google AI Studio for the models available to this API key.
+        """
+        if not api_key or not api_key.strip():
+            return []
+
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key.strip())
+            all_models = client.models.list()
+            
+            supported = []
+            for m in all_models:
+                name = getattr(m, 'name', str(m)).replace("models/", "")
+                # Only include models suitable for multimodal generateContent
+                if "gemini" in name and not any(x in name for x in ["embedding", "aqa", "imagen"]):
+                    supported.append(name)
+
+            # Sort so best modern flash/pro models appear first
+            def score_model(m):
+                score = 0
+                if "flash" in m: score += 100
+                if "pro" in m: score += 90
+                if "3." in m: score += 30
+                if "2.5" in m: score += 20
+                if "2.0" in m: score += 10
+                return -score
+
+            supported.sort(key=score_model)
+            return supported
+        except Exception:
+            # Fallback list of modern standard models
+            return ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+
+    def clean_with_gemini(
+        self, img_bytes: bytes, api_key: str, chosen_model: Optional[str] = None
+    ) -> Tuple[Optional[str], str]:
         """
         Uses Gemini Vision API to transcribe the worksheet while completely
         removing student handwriting, watermarks, and photo lighting flaws.
@@ -52,12 +89,24 @@ class WorksheetCleaner:
             "Do NOT wrap in markdown code blocks like ```html. Output raw HTML only."
         )
 
-        models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-        last_error = ""
-
         try:
             client = genai.Client(api_key=api_key.strip())
             
+            # Determine models to attempt
+            models_to_try = []
+            if chosen_model and chosen_model.strip():
+                models_to_try.append(chosen_model.strip())
+            
+            # Add dynamic available models as fallback
+            available = self.get_available_models(api_key)
+            for m in available:
+                if m not in models_to_try:
+                    models_to_try.append(m)
+
+            if not models_to_try:
+                models_to_try = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+
+            last_error = ""
             for model_name in models_to_try:
                 try:
                     response = client.models.generate_content(
@@ -75,7 +124,7 @@ class WorksheetCleaner:
                         html_text = re.sub(r"\s*```$", "", html_text, flags=re.MULTILINE).strip()
                         return html_text, f"Success (using {model_name})"
                 except Exception as e:
-                    last_error = str(e)
+                    last_error = f"{model_name}: {str(e)}"
                     continue
 
             return None, f"Gemini API error: {last_error}"
@@ -147,7 +196,6 @@ class WorksheetCleaner:
         pisa_status = pisa.CreatePDF(full_html, dest=pdf_stream, encoding='utf-8')
         
         if pisa_status.err:
-            # Fallback basic PDF
             return pdf_stream.getvalue()
         return pdf_stream.getvalue()
 
@@ -155,9 +203,6 @@ class WorksheetCleaner:
     # OPENCV LOCAL PROCESSING (FALLBACK / OFFLINE)
     # ---------------------------------------------------------
     def enhance_image(self, img: np.ndarray) -> np.ndarray:
-        """
-        Enhances image quality by adjusting contrast and sharpening slightly.
-        """
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -169,9 +214,6 @@ class WorksheetCleaner:
         return cv2.addWeighted(enhanced, 0.7, sharpened, 0.3, 0)
 
     def resize_if_large(self, img: np.ndarray, max_dim: int = 4000) -> np.ndarray:
-        """
-        Resizes the image if any dimension exceeds max_dim to prevent memory issues.
-        """
         h, w = img.shape[:2]
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)
@@ -180,9 +222,6 @@ class WorksheetCleaner:
         return img
 
     def remove_blue_pen(self, img: np.ndarray, sensitivity: float = 1.0) -> Tuple[np.ndarray, bool]:
-        """
-        Removes blue pen ink using HSV color filtering and inpainting.
-        """
         sat_lower = max(20, int(50 - (sensitivity - 1.0) * 20))
         lower_bound = np.array([90, sat_lower, 50])
         upper_bound = self.default_blue_upper
@@ -199,9 +238,6 @@ class WorksheetCleaner:
         return cleaned, True
 
     def remove_multi_color_pen(self, img: np.ndarray, sensitivity: float = 1.0) -> Tuple[np.ndarray, bool]:
-        """
-        Removes any colored or light handwriting while preserving dark printed text.
-        """
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
@@ -227,9 +263,6 @@ class WorksheetCleaner:
         return cleaned, True
 
     def process_image(self, img_bytes: bytes, mode: str, sensitivity: float, enhance: bool) -> Tuple[Optional[np.ndarray], str]:
-        """
-        Local OpenCV fallback image processing.
-        """
         try:
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -255,9 +288,6 @@ class WorksheetCleaner:
             return None, f"Error processing image: {str(e)}"
 
     def images_to_pdf(self, images_bgr: List[np.ndarray]) -> bytes:
-        """
-        Converts a list of BGR numpy images to a single PDF file using Pillow.
-        """
         pil_images = []
         for img_bgr in images_bgr:
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

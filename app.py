@@ -59,6 +59,7 @@ def main():
     )
 
     api_key = ""
+    chosen_model = ""
     if "Gemini AI" in cleaning_engine:
         # Check secrets / environment first
         default_key = os.environ.get("GEMINI_API_KEY", "")
@@ -75,6 +76,38 @@ def main():
             "👉 [Get a free key at Google AI Studio](https://aistudio.google.com/apikey)",
             unsafe_allow_html=True
         )
+
+        # Model Selection
+        default_models = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro", "gemini-2.0-flash"]
+        available_models = default_models
+
+        if api_key.strip():
+            fetched = cleaner.get_available_models(api_key)
+            if fetched:
+                available_models = fetched
+
+        chosen_model = st.sidebar.selectbox(
+            "Gemini Model",
+            options=available_models,
+            index=0,
+            help="Flash is ultra-fast with high limits. Pro provides maximum accuracy for complex layouts."
+        )
+
+        with st.sidebar.expander("📊 Free Tier Limits & Model Info"):
+            st.markdown(
+                """
+                **⚡ Flash Models (e.g. 2.5 / 3.8 Flash):**
+                - **Limit:** ~15 Requests/Min (RPM), ~1,500 Requests/Day (RPD)
+                - **Best for:** Fast batch processing of standard worksheets.
+
+                **🧠 Pro Models (e.g. 2.5 / 3.0 Pro):**
+                - **Limit:** ~2–5 Requests/Min, ~50–100 Requests/Day
+                - **Best for:** Dense handwriting, difficult fonts, complex math.
+
+                **📱 Note on Gemini Nano:**
+                *Gemini Nano is Google's on-device model running locally inside Android AICore on Pixel/Samsung phones, which is why it has no public cloud REST API. The cloud Flash and Pro models are significantly larger, smarter, and more accurate!*
+                """
+            )
 
     else:
         cv_mode = st.sidebar.radio(
@@ -116,10 +149,10 @@ def main():
                 pages_html = []
 
                 for i, file in enumerate(uploaded_files):
-                    status_text.text(f"🤖 AI processing page {i+1} of {len(uploaded_files)}...")
+                    status_text.text(f"🤖 AI processing page {i+1} of {len(uploaded_files)} using {chosen_model}...")
                     file_bytes = file.getvalue()
 
-                    html_page, msg = cleaner.clean_with_gemini(file_bytes, api_key)
+                    html_page, msg = cleaner.clean_with_gemini(file_bytes, api_key, chosen_model=chosen_model)
 
                     if not html_page:
                         st.error(f"Page {file.name}: {msg}")
