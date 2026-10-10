@@ -68,7 +68,7 @@ def main():
             unsafe_allow_html=True
         )
 
-        default_models = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro", "gemini-2.0-flash"]
+        default_models = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
         available_models = default_models
 
         if api_key.strip():
@@ -80,8 +80,24 @@ def main():
             "AI Model",
             options=available_models,
             index=0,
-            help="Flash is ultra-fast with 1500 free requests/day. Pro offers maximum precision."
+            help="Flash-Lite is ultra-fast, lightweight, and generous with limits."
         )
+
+        with st.sidebar.expander("📊 Model Tiers & Free Limits"):
+            st.markdown(
+                """
+                **⚡ Gemini 3.1 Flash-Lite (Recommended):**
+                - **Speed:** Fastest latency (~1s per image)
+                - **Limit:** ~15–30 Requests/Min, ~1,500+ Requests/Day
+                - **Cost:** 100% Free
+                
+                **🚀 Gemini 2.5 / 3.8 Flash:**
+                - Standard high-capacity multimodal model.
+                
+                **🧠 Gemini 2.5 / 3.0 Pro:**
+                - Deep reasoning for very messy or faint handwriting (~2–5 RPM).
+                """
+            )
 
     else:
         cv_mode = st.sidebar.radio(

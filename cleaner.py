@@ -44,6 +44,7 @@ class WorksheetCleaner:
 
             def score_model(m):
                 score = 0
+                if "3.1-flash-lite" in m or "lite" in m: score += 150
                 if "flash" in m: score += 100
                 if "pro" in m: score += 90
                 if "3." in m: score += 30
@@ -54,7 +55,7 @@ class WorksheetCleaner:
             supported.sort(key=score_model)
             return supported
         except Exception:
-            return ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro", "gemini-2.0-flash"]
+            return ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
 
     def clean_image_with_gemini_ai(
         self, img_bytes: bytes, api_key: str, chosen_model: Optional[str] = None
@@ -104,7 +105,7 @@ class WorksheetCleaner:
                     models_to_try.append(m)
 
             if not models_to_try:
-                models_to_try = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
+                models_to_try = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
 
             boxes = []
             used_model = ""
