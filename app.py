@@ -71,25 +71,50 @@ def main():
         openrouter_models = [
             "google/gemini-3-pro-image",
             "google/gemini-nano-banana-2.1",
+            "google/gemini-3.1-flash-image",
             "google/gemini-2.5-flash-image",
+            "openai/gpt-5-image",
+            "openai/gpt-5-image-mini",
+            "black-forest-labs/flux.2-pro",
+            "black-forest-labs/flux-1-dev",
+            "black-forest-labs/flux-1-schnell",
+            "qwen/qwen-2.5-vl-72b-instruct",
+            "qwen/qwen3-vl-8b-instruct",
+            "Custom Model...",
         ]
 
-        chosen_model = st.sidebar.selectbox(
+        selected_option = st.sidebar.selectbox(
             "AI Model",
             options=openrouter_models,
             index=0,
-            help="Nano Banana Pro (gemini-3-pro-image) provides highest quality text and table preservation."
+            help="Choose between Nano Banana Pro, GPT-5 Image, Flux, Qwen, or a custom model."
         )
 
-        with st.sidebar.expander("ℹ️ Model Info"):
+        if selected_option == "Custom Model...":
+            chosen_model = st.sidebar.text_input("Enter OpenRouter Model Slug", value="google/gemini-3-pro-image")
+        else:
+            chosen_model = selected_option
+
+        with st.sidebar.expander("ℹ️ Model Info & Modalities"):
             st.markdown(
                 """
-                **🍌 `google/gemini-3-pro-image` (Nano Banana Pro):**
-                - Highest quality visual fidelity.
-                - Best for keeping printed typography, question text, and tables sharp.
-                
-                **⚡ `google/gemini-nano-banana-2.1`:**
-                - High-efficiency workhorse model.
+                **🍌 Google Image Models (Native Image-to-Image):**
+                - `google/gemini-3-pro-image` (Nano Banana Pro — Highest quality text & question preservation)
+                - `google/gemini-nano-banana-2.1` (Ultra fast & cheap)
+                - `google/gemini-3.1-flash-image` (Flash image generation)
+                - `google/gemini-2.5-flash-image` (Standard Flash image)
+
+                **✨ OpenAI Image Models:**
+                - `openai/gpt-5-image` (Flagship multimodal image output)
+                - `openai/gpt-5-image-mini` (Fast multimodal image output)
+
+                **🎨 FLUX Models (Black Forest Labs):**
+                - `black-forest-labs/flux.2-pro` / `flux-1-dev` / `flux-1-schnell`
+                *(Note: FLUX on OpenRouter is text-to-image art generation).*
+
+                **👁️ Qwen Multimodal Models:**
+                - `qwen/qwen-2.5-vl-72b-instruct` / `qwen3-vl-8b-instruct`
+                *(Note: Qwen VL is vision-to-text; it analyzes documents and outputs text, not images).*
                 """
             )
 

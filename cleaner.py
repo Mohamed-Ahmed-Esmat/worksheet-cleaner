@@ -96,8 +96,11 @@ class WorksheetCleaner:
             if not cleaned_bytes:
                 # Log snippet for debugging if image is missing
                 msg_obj = choices[0].get("message", {})
+                content_val = msg_obj.get("content")
+                if content_val and isinstance(content_val, str) and content_val.strip():
+                    return None, f"Model '{model}' returned text instead of an image:\n\n\"{content_val.strip()[:250]}\"\n\n👉 This model is text/vision-only. For image-to-image worksheet regeneration, select 'google/gemini-3-pro-image' (Nano Banana Pro) or another image output model."
                 snippet = str(msg_obj)[:300]
-                return None, f"Could not find image in model response: {snippet}"
+                return None, f"Could not find image in model response from '{model}': {snippet}"
 
             # Convert image bytes to BGR numpy array
             nparr = np.frombuffer(cleaned_bytes, np.uint8)
