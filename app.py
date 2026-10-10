@@ -31,11 +31,8 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-@st.cache_resource
-def get_cleaner():
-    return WorksheetCleaner()
-
-cleaner = get_cleaner()
+# Always instantiate fresh cleaner instance to prevent stale cache on Cloud reloads
+cleaner = WorksheetCleaner()
 
 def main():
     st.title("📝 Worksheet Cleaner")
@@ -68,7 +65,19 @@ def main():
             unsafe_allow_html=True
         )
 
-        image_models = cleaner.get_available_image_models(api_key)
+        default_image_models = [
+            "gemini-3.1-flash-lite-image",
+            "gemini-3.1-flash-image",
+            "gemini-nano-banana-2.1",
+            "gemini-3-pro-image",
+        ]
+        if hasattr(cleaner, "get_available_image_models"):
+            try:
+                image_models = cleaner.get_available_image_models(api_key)
+            except Exception:
+                image_models = default_image_models
+        else:
+            image_models = default_image_models
 
         chosen_model = st.sidebar.selectbox(
             "Image Generation Model",
@@ -131,7 +140,11 @@ def main():
 
                 if "AI Image Regeneration" in cleaning_engine:
                     status_text.text(f"🎨 Regenerating clean image {i+1} of {len(uploaded_files)} using {chosen_model}...")
-                    cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
+                    if hasattr(cleaner, "regenerate_image_with_ai"):
+                        cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
+                    else:
+                        from cleaner import WorksheetCleaner
+                        cleaned_bgr, msg = WorksheetCleaner().regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
                 else:
                     status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
                     cleaned_bgr, msg = cleaner.process_image(file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance)
