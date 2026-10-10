@@ -1,11 +1,10 @@
 """
 Core image processing logic for Worksheet Cleaner.
 Supports:
-1. Native Gemini Image Regeneration (Nano Banana / Flash Image):
-   Uses Gemini's native image-to-image multimodal generation to REGENERATE
-   the exact worksheet image cleanly without the handwritten answers.
-2. AI Bounding Box Inpainting (Fallback).
-3. Local OpenCV Filter (Offline).
+1. OpenRouter API: Calls Google Nano Banana Pro (google/gemini-3-pro-image)
+   and Nano Banana 2.1 via OpenRouter's global API to directly regenerate
+   clean worksheet images without regional/country restrictions.
+2. Local OpenCV filter (Offline).
 """
 
 import cv2
@@ -13,52 +12,21 @@ import numpy as np
 from PIL import Image
 import io
 import re
-import json
 import base64
+import requests
 from typing import List, Tuple, Optional
 
 
 class WorksheetCleaner:
     def __init__(self):
-        # Default HSV bounds for blue pen ink
+        # Default HSV bounds for blue pen ink (offline fallback)
         self.default_blue_lower = np.array([90, 50, 50])
         self.default_blue_upper = np.array([130, 255, 255])
 
     # ---------------------------------------------------------
-    # 1. NATIVE GEMINI IMAGE REGENERATION (NANO BANANA / FLASH-IMAGE)
+    # 1. OPENROUTER API (NANO BANANA PRO & GEMINI IMAGE MODELS)
     # ---------------------------------------------------------
-    def get_available_image_models(self, api_key: str) -> List[str]:
-        """
-        Dynamically finds available Gemini Image models (Nano Banana / Flash Image family).
-        """
-        preferred = [
-            "gemini-3.1-flash-lite-image",
-            "gemini-3.1-flash-image",
-            "gemini-nano-banana-2.1",
-            "gemini-3-pro-image",
-        ]
-
-        if not api_key or not api_key.strip():
-            return preferred
-
-        try:
-            from google import genai
-            client = genai.Client(api_key=api_key.strip())
-            all_models = client.models.list()
-            supported = []
-            for m in all_models:
-                name = getattr(m, 'name', str(m)).replace("models/", "")
-                if any(x in name for x in ["image", "banana", "nano"]):
-                    supported.append(name)
-
-            if supported:
-                return supported
-        except Exception:
-            pass
-
-        return preferred
-
-    def regenerate_image_with_ai(
+    def regenerate_image_with_openrouter(
         self,
         img_bytes: bytes,
         api_key: str,
@@ -66,146 +34,146 @@ class WorksheetCleaner:
         custom_prompt: Optional[str] = None,
     ) -> Tuple[Optional[np.ndarray], str]:
         """
-        Calls Gemini Image Generation (Nano Banana / Flash-Image) to take the
-        worksheet photo and directly REGENERATE the clean page image with all
-        answers cleanly removed.
+        Sends the worksheet photo to OpenRouter to run Nano Banana Pro
+        (google/gemini-3-pro-image) and return the regenerated clean image.
+        Uses pure HTTP requests (curl style).
         """
-        try:
-            from google import genai
-            from google.genai import types
-        except ImportError:
-            return None, "Error: google-genai library is not installed."
+        if not api_key or not api_key.strip():
+            return None, "Error: OpenRouter API key is missing. Please enter your key in the sidebar."
 
-        client = genai.Client(api_key=api_key.strip())
+        # Model selection
+        model = chosen_model.strip() if chosen_model and chosen_model.strip() else "google/gemini-3-pro-image"
 
+        # Default prompt
         default_prompt = "Remove all handwritten pen answers from this image and return the clean questions only."
-
         prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else default_prompt
 
-        models_to_try = []
-        if chosen_model and chosen_model.strip():
-            models_to_try.append(chosen_model.strip())
+        # Encode image to base64
+        b64_image = base64.b64encode(img_bytes).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64_image}"
 
-        defaults = [
-            "gemini-3.1-flash-lite-image",
-            "gemini-3.1-flash-image",
-            "gemini-nano-banana-2.1",
-            "gemini-3-pro-image",
-        ]
-        for m in defaults:
-            if m not in models_to_try:
-                models_to_try.append(m)
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://worksheet-cleaner.streamlit.app",
+            "X-Title": "Worksheet Cleaner",
+        }
 
-        last_error = ""
-
-        # Attempt 1: Direct native image regeneration
-        for model_name in models_to_try:
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                        prompt,
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
                     ],
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"]
-                    )
-                )
+                }
+            ],
+            "modalities": ["image", "text"],
+        }
 
-                if response and response.candidates:
-                    for part in response.candidates[0].content.parts:
-                        if getattr(part, 'inline_data', None):
-                            raw_data = part.inline_data.data
-                            if isinstance(raw_data, str):
-                                raw_bytes = base64.b64decode(raw_data)
-                            else:
-                                raw_bytes = raw_data
-
-                            nparr = np.frombuffer(raw_bytes, np.uint8)
-                            cleaned_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                            if cleaned_bgr is not None:
-                                return cleaned_bgr, f"Successfully regenerated using {model_name}"
-
-            except Exception as e:
-                last_error = f"{model_name}: {str(e)}"
-                continue
-
-        # Format helpful message for known errors
-        if "limit: 0" in last_error or "RESOURCE_EXHAUSTED" in last_error:
-            return None, (
-                "Google Quota Limit (FreeTier limit is 0 for image synthesis). "
-                "To use native image generation, please enable Pay-as-you-go billing on your Google AI Studio project at aistudio.google.com."
-            )
-        elif "not available in your country" in last_error:
-            return None, (
-                "Image generation is geo-blocked by Google for local Egyptian IP addresses. "
-                "Run this on your deployed Streamlit Cloud app (hosted on US AWS servers) to bypass the restriction."
-            )
-
-        return None, f"Image regeneration failed: {last_error}"
-
-    def fallback_coordinate_inpaint(self, img_bytes: bytes, client) -> Tuple[Optional[np.ndarray], str]:
-        """
-        Fallback inpainting using multimodal coordinate detection.
-        """
         try:
-            from google.genai import types
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return None, "Decode error"
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
 
-            img = self.resize_if_large(img)
-            h, w = img.shape[:2]
+            if resp.status_code != 200:
+                try:
+                    err_json = resp.json()
+                    err_msg = err_json.get("error", {}).get("message", resp.text)
+                except Exception:
+                    err_msg = resp.text
+                return None, f"OpenRouter API error ({resp.status_code}): {err_msg}"
 
-            prompt = (
-                "Detect all handwritten text, student answers, and pen markings in this image. "
-                "Do NOT detect printed text or table grids. "
-                "Return a JSON array of bounding boxes normalized from 0 to 1000: "
-                '[{"box_2d": [ymin, xmin, ymax, xmax]}]'
-            )
+            data = resp.json()
+            choices = data.get("choices", [])
+            if not choices:
+                return None, f"No response choices returned from OpenRouter: {data}"
 
-            response = client.models.generate_content(
-                model="gemini-3.1-flash-lite",
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
-                    prompt,
-                ]
-            )
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
 
-            raw_text = response.text if response else ""
-            boxes = []
-            nums = re.findall(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', raw_text)
-            for n in nums:
-                boxes.append({"box_2d": [int(x) for x in n]})
+            # Extract generated image bytes from response
+            cleaned_bytes = self.extract_image_bytes_from_content(content)
+            if not cleaned_bytes:
+                # Sometimes images are returned under message.parts or images array
+                if "images" in message and message["images"]:
+                    first_img = message["images"][0]
+                    cleaned_bytes = self.extract_image_bytes_from_content(first_img)
 
-            mask = np.zeros((h, w), dtype=np.uint8)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if not cleaned_bytes:
+                # Check if it was returned as a text explanation
+                snippet = str(content)[:200]
+                return None, f"Model responded with text instead of image: {snippet}"
 
-            for b in boxes:
-                box = b.get("box_2d", [])
-                if len(box) == 4:
-                    y1 = max(0, int(box[0] * h / 1000.0))
-                    x1 = max(0, int(box[1] * w / 1000.0))
-                    y2 = min(h, int(box[2] * h / 1000.0))
-                    x2 = min(w, int(box[3] * w / 1000.0))
-                    if y2 > y1 and x2 > x1:
-                        roi = gray[y1:y2, x1:x2]
-                        pval = np.percentile(roi, 80)
-                        smask = (roi < (pval - 20)).astype(np.uint8) * 255
-                        kernel = np.ones((3, 3), np.uint8)
-                        smask = cv2.dilate(smask, kernel, iterations=1)
-                        mask[y1:y2, x1:x2] = cv2.bitwise_or(mask[y1:y2, x1:x2], smask)
+            # Convert image bytes to BGR numpy array
+            nparr = np.frombuffer(cleaned_bytes, np.uint8)
+            cleaned_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            if cv2.countNonZero(mask) > 0:
-                cleaned = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
-                return cleaned, "Cleaned via coordinate inpainting"
-            return img, "No handwriting detected"
+            if cleaned_bgr is None:
+                return None, "Error: Could not decode regenerated image bytes."
+
+            return cleaned_bgr, f"Successfully regenerated using {model}"
+
+        except requests.exceptions.Timeout:
+            return None, "Error: OpenRouter request timed out after 120 seconds. Please try again."
         except Exception as e:
-            return None, str(e)
+            return None, f"Request error: {str(e)}"
+
+    def extract_image_bytes_from_content(self, content) -> Optional[bytes]:
+        """
+        Parses base64 data URLs, http links, or raw base64 from OpenRouter response.
+        """
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if "image_url" in part:
+                        url = part["image_url"].get("url", "")
+                        res = self.extract_image_bytes_from_content(url)
+                        if res: return res
+                    if "image" in part:
+                        res = self.extract_image_bytes_from_content(part["image"])
+                        if res: return res
+
+        elif isinstance(content, str):
+            # 1. Base64 data URL pattern
+            m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content)
+            if m:
+                try:
+                    return base64.b64decode(m.group(1))
+                except Exception:
+                    pass
+
+            # 2. Markdown image URL pattern ![...](https://...)
+            m_url = re.search(r"!\[.*?\]\((https?://[^\s\)]+)\)", content)
+            if m_url:
+                try:
+                    img_resp = requests.get(m_url.group(1), timeout=30)
+                    if img_resp.status_code == 200:
+                        return img_resp.content
+                except Exception:
+                    pass
+
+            # 3. Direct HTTP URL
+            if content.startswith("http://") or content.startswith("https://"):
+                try:
+                    img_resp = requests.get(content.strip(), timeout=30)
+                    if img_resp.status_code == 200:
+                        return img_resp.content
+                except Exception:
+                    pass
+
+            # 4. Raw base64 string
+            if len(content) > 1000 and not content.startswith("{") and not content.startswith("<"):
+                try:
+                    return base64.b64decode(content.strip())
+                except Exception:
+                    pass
+
+        return None
 
     # ---------------------------------------------------------
-    # 2. LOCAL OPENCV PROCESSING (OFFLINE)
+    # 2. LOCAL OPENCV PROCESSING (OFFLINE FALLBACK)
     # ---------------------------------------------------------
     def enhance_image(self, img: np.ndarray) -> np.ndarray:
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)

@@ -1,7 +1,7 @@
 """
 Streamlit Web Application for Worksheet Cleaner.
 Mobile-first UI to upload photos, regenerate clean worksheet images using
-Gemini Image models (Nano Banana / Flash Image), and compile them into a PDF.
+OpenRouter (Nano Banana Pro / Gemini Image), and compile them into a PDF.
 """
 
 import streamlit as st
@@ -31,7 +31,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# Always instantiate fresh cleaner instance to prevent stale cache on Cloud reloads
+# Fresh instance to prevent stale cache across reloads
 cleaner = WorksheetCleaner()
 
 def main():
@@ -43,61 +43,53 @@ def main():
 
     cleaning_engine = st.sidebar.radio(
         "Cleaning Engine",
-        ["🌟 AI Image Regeneration (Nano Banana / Flash-Image)", "🎨 Local OpenCV Filter (Offline)"],
-        help="Gemini Image models take your photo and regenerate the exact clean worksheet image with answers erased."
+        ["🌟 OpenRouter (Nano Banana Pro)", "🎨 Local OpenCV Filter (Offline)"],
+        help="OpenRouter routes directly to Google's Nano Banana Pro with zero regional geo-blocks."
     )
 
     api_key = ""
     chosen_model = ""
-    if "AI Image Regeneration" in cleaning_engine:
-        default_key = os.environ.get("GEMINI_API_KEY", "")
-        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-            default_key = st.secrets["GEMINI_API_KEY"]
+    default_ai_prompt = ""
+
+    if "OpenRouter" in cleaning_engine:
+        # Check secrets / environment first
+        default_key = os.environ.get("OPENROUTER_API_KEY", "")
+        if hasattr(st, "secrets") and "OPENROUTER_API_KEY" in st.secrets:
+            default_key = st.secrets["OPENROUTER_API_KEY"]
 
         api_key = st.sidebar.text_input(
-            "Gemini API Key",
+            "OpenRouter API Key",
             value=default_key,
             type="password",
-            help="Free API key from Google AI Studio."
+            help="Your API key from openrouter.ai (starts with sk-or-v1-...)."
         )
         st.sidebar.markdown(
-            "👉 [Get a free key at Google AI Studio](https://aistudio.google.com/apikey)",
+            "👉 [Get API Key at openrouter.ai/keys](https://openrouter.ai/keys)",
             unsafe_allow_html=True
         )
 
-        default_image_models = [
-            "gemini-3.1-flash-lite-image",
-            "gemini-3.1-flash-image",
-            "gemini-nano-banana-2.1",
-            "gemini-3-pro-image",
+        openrouter_models = [
+            "google/gemini-3-pro-image",
+            "google/gemini-nano-banana-2.1",
+            "google/gemini-2.5-flash-image",
         ]
-        if hasattr(cleaner, "get_available_image_models"):
-            try:
-                image_models = cleaner.get_available_image_models(api_key)
-            except Exception:
-                image_models = default_image_models
-        else:
-            image_models = default_image_models
 
         chosen_model = st.sidebar.selectbox(
-            "Image Generation Model",
-            options=image_models,
+            "AI Model",
+            options=openrouter_models,
             index=0,
-            help="gemini-3.1-flash-lite-image is ultra-fast with high free-tier limits. Nano Banana Pro offers maximum precision."
+            help="Nano Banana Pro (gemini-3-pro-image) provides highest quality text and table preservation."
         )
 
-        with st.sidebar.expander("ℹ️ Model Details & Quotas"):
+        with st.sidebar.expander("ℹ️ Model Info"):
             st.markdown(
                 """
-                **⚡ `gemini-3.1-flash-lite-image`:**
-                - High-speed, high-quota image generation model.
-                - Best for multi-page batch booklet cleaning.
-
-                **🍌 `gemini-3.1-flash-image` (Nano Banana 2):**
-                - Standard balanced multimodal image model.
-
-                **🧠 `gemini-3-pro-image` (Nano Banana Pro):**
-                - Maximum fidelity for complex typography and tables.
+                **🍌 `google/gemini-3-pro-image` (Nano Banana Pro):**
+                - Highest quality visual fidelity.
+                - Best for keeping printed typography, question text, and tables sharp.
+                
+                **⚡ `google/gemini-nano-banana-2.1`:**
+                - High-efficiency workhorse model.
                 """
             )
 
@@ -106,11 +98,11 @@ def main():
                 "Prompt Instructions",
                 value="Remove all handwritten pen answers from this image and return the clean questions only.",
                 height=100,
-                help="You can customize instructions here if you want specific rules for your worksheets."
+                help="You can customize instructions here."
             )
         default_ai_prompt = ai_prompt
+
     else:
-        default_ai_prompt = ""
         cv_mode = st.sidebar.radio(
             "Detection Mode",
             ["Blue Pen Removal", "Auto-Detect (Any Color)"],
@@ -136,8 +128,8 @@ def main():
         st.caption(f"📁 {len(uploaded_files)} image(s) selected")
 
         if st.button("🧹 Regenerate Clean Pages & PDF", type="primary", use_container_width=True):
-            if "AI Image Regeneration" in cleaning_engine and not api_key.strip():
-                st.error("⚠️ Please enter your Gemini API Key in the sidebar to use AI mode. It's completely free from Google AI Studio!")
+            if "OpenRouter" in cleaning_engine and not api_key.strip():
+                st.error("⚠️ Please enter your OpenRouter API Key in the sidebar (starts with sk-or-v1-...).")
                 return
 
             progress_bar = st.progress(0)
@@ -147,16 +139,16 @@ def main():
             for i, file in enumerate(uploaded_files):
                 file_bytes = file.getvalue()
 
-                if "AI Image Regeneration" in cleaning_engine:
-                    status_text.text(f"🎨 Regenerating clean image {i+1} of {len(uploaded_files)} using {chosen_model}...")
-                    if hasattr(cleaner, "regenerate_image_with_ai"):
-                        cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt)
-                    else:
-                        from cleaner import WorksheetCleaner
-                        cleaned_bgr, msg = WorksheetCleaner().regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt)
+                if "OpenRouter" in cleaning_engine:
+                    status_text.text(f"🎨 Nano Banana Pro regenerating image {i+1} of {len(uploaded_files)}...")
+                    cleaned_bgr, msg = cleaner.regenerate_image_with_openrouter(
+                        file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt
+                    )
                 else:
                     status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
-                    cleaned_bgr, msg = cleaner.process_image(file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance)
+                    cleaned_bgr, msg = cleaner.process_image(
+                        file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance
+                    )
 
                 if cleaned_bgr is None:
                     st.error(f"File {file.name}: {msg}")
@@ -175,7 +167,7 @@ def main():
                         st.image(file_bytes, caption="Original Uploaded Photo", use_container_width=True)
                     with col2:
                         cleaned_rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
-                        st.image(cleaned_rgb, caption="✨ AI-Regenerated Clean Image", use_container_width=True)
+                        st.image(cleaned_rgb, caption="✨ Nano Banana Pro Cleaned Image", use_container_width=True)
 
                 progress_bar.progress((i + 1) / len(uploaded_files))
 
@@ -198,7 +190,7 @@ def main():
     st.markdown(
         """
         <div style='text-align: center; color: gray; font-size: 0.85em;'>
-            💡 <strong>Image Regeneration:</strong> Takes your solved booklet photo and regenerates a clean digital image with all answers removed, ready to print!
+            💡 <strong>Powered by Nano Banana Pro:</strong> Takes your solved booklet photos and directly synthesizes clean digital worksheet images with all answers erased.
         </div>
         """,
         unsafe_allow_html=True
