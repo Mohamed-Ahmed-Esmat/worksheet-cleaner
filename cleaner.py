@@ -1,8 +1,9 @@
 """
 Core image processing logic for Worksheet Cleaner.
 Supports:
-1. Gemini AI reconstruction: Reconstructs clean, watermark-free, blank worksheets from photos.
-2. Local OpenCV filtering: HSV color filtering and inpainting for high-contrast scans.
+1. AI Image Eraser: Uses Gemini Vision to detect exact coordinates of handwritten answers,
+   then inpaints/erases them directly from the original image, returning the exact cleaned page.
+2. Local OpenCV Eraser: Traditional color thresholding for clean scans.
 """
 
 import cv2
@@ -10,8 +11,8 @@ import numpy as np
 from PIL import Image
 import io
 import re
+import json
 from typing import List, Tuple, Optional
-from xhtml2pdf import pisa
 
 
 class WorksheetCleaner:
@@ -21,11 +22,11 @@ class WorksheetCleaner:
         self.default_blue_upper = np.array([130, 255, 255])
 
     # ---------------------------------------------------------
-    # GEMINI AI PROCESSING
+    # GEMINI AI IMAGE ERASER (IMAGE IN -> CLEANED IMAGE OUT)
     # ---------------------------------------------------------
     def get_available_models(self, api_key: str) -> List[str]:
         """
-        Dynamically queries Google AI Studio for the models available to this API key.
+        Dynamically queries Google AI Studio for models available to this API key.
         """
         if not api_key or not api_key.strip():
             return []
@@ -38,11 +39,9 @@ class WorksheetCleaner:
             supported = []
             for m in all_models:
                 name = getattr(m, 'name', str(m)).replace("models/", "")
-                # Only include models suitable for multimodal generateContent
                 if "gemini" in name and not any(x in name for x in ["embedding", "aqa", "imagen"]):
                     supported.append(name)
 
-            # Sort so best modern flash/pro models appear first
             def score_model(m):
                 score = 0
                 if "flash" in m: score += 100
@@ -55,16 +54,15 @@ class WorksheetCleaner:
             supported.sort(key=score_model)
             return supported
         except Exception:
-            # Fallback list of modern standard models
-            return ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+            return ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro", "gemini-2.0-flash"]
 
-    def clean_with_gemini(
+    def clean_image_with_gemini_ai(
         self, img_bytes: bytes, api_key: str, chosen_model: Optional[str] = None
-    ) -> Tuple[Optional[str], str]:
+    ) -> Tuple[Optional[np.ndarray], str]:
         """
-        Uses Gemini Vision API to transcribe the worksheet while completely
-        removing student handwriting, watermarks, and photo lighting flaws.
-        Returns HTML string of the cleaned page and a status message.
+        Uses Gemini Vision to locate student handwriting/answers on the page,
+        then precisely in-paints and erases them from the ORIGINAL IMAGE.
+        Returns the cleaned image (BGR numpy array) and status message.
         """
         try:
             from google import genai
@@ -72,41 +70,46 @@ class WorksheetCleaner:
         except ImportError:
             return None, "Error: google-genai library is not installed."
 
+        # Decode original image
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None, "Error: Could not decode image."
+
+        img = self.resize_if_large(img)
+        h, w = img.shape[:2]
+
         prompt = (
-            "You are an expert school worksheet transcriber and educator.\n"
-            "Analyze this photo of a school assignment/workbook page carefully.\n\n"
-            "TASKS:\n"
-            "1. Transcribe the COMPLETE printed worksheet exactly as formatted (headers, titles, instructions, "
-            "grammar tables, examples, numbers, questions, and punctuation).\n"
-            "2. CRITICAL: Completely REMOVE all student handwritten answers, pen strokes, doodles, and markings.\n"
-            "3. Replace every removed answer or fill-in section with a clean blank space for a new student:\n"
-            "   - In tables: leave the cell blank (e.g. <td>&nbsp;</td>).\n"
-            "   - In fill-in-the-blank questions: insert a clean dotted line (e.g. <span class='blank'>........................................</span>).\n"
-            "4. Remove any watermarks (such as 'Al Retaj' or publisher marks), page shadows, desk backgrounds, and camera skew.\n"
-            "5. Generate clean, semantic HTML with clean table borders and high-contrast black typography.\n\n"
-            "OUTPUT FORMAT:\n"
-            "Return ONLY the HTML inside a single `<div class='worksheet-page'>...</div>` element.\n"
-            "Do NOT wrap in markdown code blocks like ```html. Output raw HTML only."
+            "You are an expert document analysis AI.\n"
+            "Analyze this photo of a school workbook/worksheet page.\n"
+            "Detect ALL student handwriting, handwritten answers, filled-in table cells, pen scribbles, and written solutions.\n"
+            "CRITICAL: Do NOT detect printed typography, printed questions, printed headers, or table lines.\n\n"
+            "Return a JSON array of 2D bounding boxes enclosing each handwritten answer, normalized from 0 to 1000:\n"
+            "[\n"
+            '  {"box_2d": [ymin, xmin, ymax, xmax], "label": "handwriting"}\n'
+            "]\n"
+            "Output ONLY the raw JSON array. No explanations or markdown."
         )
 
         try:
             client = genai.Client(api_key=api_key.strip())
             
-            # Determine models to attempt
             models_to_try = []
             if chosen_model and chosen_model.strip():
                 models_to_try.append(chosen_model.strip())
             
-            # Add dynamic available models as fallback
             available = self.get_available_models(api_key)
             for m in available:
                 if m not in models_to_try:
                     models_to_try.append(m)
 
             if not models_to_try:
-                models_to_try = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+                models_to_try = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro"]
 
+            boxes = []
+            used_model = ""
             last_error = ""
+
             for model_name in models_to_try:
                 try:
                     response = client.models.generate_content(
@@ -116,88 +119,73 @@ class WorksheetCleaner:
                             prompt,
                         ]
                     )
-                    
                     if response and response.text:
-                        html_text = response.text.strip()
-                        # Clean any accidental markdown code fences
-                        html_text = re.sub(r"^```(?:html)?\s*", "", html_text, flags=re.MULTILINE)
-                        html_text = re.sub(r"\s*```$", "", html_text, flags=re.MULTILINE).strip()
-                        return html_text, f"Success (using {model_name})"
+                        raw_text = response.text.strip()
+                        # Extract JSON array
+                        match = re.search(r'\[\s*\{.*\}\s*\]', raw_text, re.DOTALL)
+                        if match:
+                            try:
+                                boxes = json.loads(match.group(0))
+                            except Exception:
+                                pass
+                        
+                        if not boxes:
+                            # Fallback regex for [ymin, xmin, ymax, xmax]
+                            nums = re.findall(r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]', raw_text)
+                            for n in nums:
+                                boxes.append({"box_2d": [int(x) for x in n]})
+
+                        used_model = model_name
+                        break
                 except Exception as e:
-                    last_error = f"{model_name}: {str(e)}"
+                    last_error = str(e)
                     continue
 
-            return None, f"Gemini API error: {last_error}"
+            if not boxes and not used_model:
+                return None, f"Gemini API error: {last_error}"
+
+            # Inpaint the detected handwriting directly on the original image
+            cleaned_img = self.inpaint_boxes(img, boxes)
+            msg = f"Cleaned {len(boxes)} handwritten areas using {used_model}"
+            return cleaned_img, msg
 
         except Exception as e:
-            return None, f"Failed to initialize Gemini Client: {str(e)}"
+            return None, f"Failed to process with Gemini: {str(e)}"
 
-    def html_to_pdf(self, pages_html: List[str]) -> bytes:
+    def inpaint_boxes(self, img: np.ndarray, boxes: List[dict]) -> np.ndarray:
         """
-        Combines a list of page HTML strings into a clean printable PDF.
+        Creates a stroke mask inside the AI-detected bounding boxes and erases the handwriting.
         """
-        css = """
-        <style>
-            @page {
-                size: a4 portrait;
-                margin: 1.5cm;
-            }
-            body {
-                font-family: Helvetica, Arial, sans-serif;
-                color: #111111;
-                font-size: 13pt;
-                line-height: 1.6;
-            }
-            .worksheet-page {
-                page-break-after: always;
-            }
-            .worksheet-page:last-child {
-                page-break-after: auto;
-            }
-            h1, h2, h3 {
-                color: #000000;
-                margin-top: 0;
-                margin-bottom: 12px;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin: 15px 0;
-            }
-            th, td {
-                border: 1.5px solid #222222;
-                padding: 8px 12px;
-                text-align: left;
-                vertical-align: middle;
-            }
-            th {
-                background-color: #f2f2f2;
-                font-weight: bold;
-            }
-            .blank {
-                color: #555555;
-                font-weight: normal;
-                letter-spacing: 2px;
-            }
-            ul, ol {
-                margin: 10px 0;
-                padding-left: 25px;
-            }
-            li {
-                margin-bottom: 8px;
-            }
-        </style>
-        """
+        h, w = img.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        body_content = "\n".join(pages_html)
-        full_html = f"<!DOCTYPE html><html><head><meta charset='utf-8'>{css}</head><body>{body_content}</body></html>"
+        for item in boxes:
+            box = item.get("box_2d", [])
+            if len(box) == 4:
+                ymin, xmin, ymax, xmax = box
+                y1 = max(0, int(ymin * h / 1000.0))
+                x1 = max(0, int(xmin * w / 1000.0))
+                y2 = min(h, int(ymax * h / 1000.0))
+                x2 = min(w, int(xmax * w / 1000.0))
 
-        pdf_stream = io.BytesIO()
-        pisa_status = pisa.CreatePDF(full_html, dest=pdf_stream, encoding='utf-8')
-        
-        if pisa_status.err:
-            return pdf_stream.getvalue()
-        return pdf_stream.getvalue()
+                if y2 > y1 and x2 > x1:
+                    roi_gray = gray[y1:y2, x1:x2]
+                    # Estimate local paper brightness
+                    paper_val = np.percentile(roi_gray, 80)
+                    
+                    # Target ink strokes that are darker than the local paper
+                    stroke_mask = roi_gray < (paper_val - 20)
+                    kernel = np.ones((3, 3), np.uint8)
+                    stroke_uint8 = (stroke_mask.astype(np.uint8)) * 255
+                    stroke_uint8 = cv2.dilate(stroke_uint8, kernel, iterations=1)
+
+                    mask[y1:y2, x1:x2] = cv2.bitwise_or(mask[y1:y2, x1:x2], stroke_uint8)
+
+        if cv2.countNonZero(mask) > 0:
+            cleaned = cv2.inpaint(img, mask, 5, cv2.INPAINT_TELEA)
+            return cleaned
+        return img
 
     # ---------------------------------------------------------
     # OPENCV LOCAL PROCESSING (FALLBACK / OFFLINE)
@@ -213,7 +201,7 @@ class WorksheetCleaner:
         sharpened = cv2.filter2D(enhanced, -1, kernel)
         return cv2.addWeighted(enhanced, 0.7, sharpened, 0.3, 0)
 
-    def resize_if_large(self, img: np.ndarray, max_dim: int = 4000) -> np.ndarray:
+    def resize_if_large(self, img: np.ndarray, max_dim: int = 3000) -> np.ndarray:
         h, w = img.shape[:2]
         if max(h, w) > max_dim:
             scale = max_dim / max(h, w)
@@ -288,6 +276,9 @@ class WorksheetCleaner:
             return None, f"Error processing image: {str(e)}"
 
     def images_to_pdf(self, images_bgr: List[np.ndarray]) -> bytes:
+        """
+        Converts a list of BGR numpy images into a multi-page PDF using Pillow.
+        """
         pil_images = []
         for img_bgr in images_bgr:
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

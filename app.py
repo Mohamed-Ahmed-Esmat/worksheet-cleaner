@@ -1,7 +1,7 @@
 """
 Streamlit Web Application for Worksheet Cleaner.
-Mobile-first UI to upload photos, remove pen answers using Gemini AI or OpenCV,
-and generate a clean printable PDF.
+Mobile-first UI to upload photos, remove pen answers directly from the images,
+and generate a clean printable PDF of the cleaned page images.
 """
 
 import streamlit as st
@@ -26,14 +26,6 @@ st.markdown(
         height: 3em;
         font-weight: 600;
     }
-    .preview-box {
-        border: 1px solid #ddd;
-        border-radius: 8px;
-        padding: 15px;
-        background-color: #ffffff;
-        margin-top: 10px;
-        margin-bottom: 20px;
-    }
     </style>
     """,
     unsafe_allow_html=True
@@ -47,21 +39,20 @@ cleaner = get_cleaner()
 
 def main():
     st.title("📝 Worksheet Cleaner")
-    st.markdown("Remove student answers from school booklets — upload photos, get a clean printable PDF.")
+    st.markdown("Erase pen answers from school booklet photos — get back the exact clean page images in a PDF.")
 
     # Sidebar
     st.sidebar.header("⚙️ Settings")
 
     cleaning_engine = st.sidebar.radio(
-        "Engine",
-        ["🌟 Gemini AI (Recommended)", "🎨 Local OpenCV (Offline)"],
-        help="Gemini AI completely erases handwriting, watermarks, and shadows, reconstructing a clean blank sheet."
+        "Cleaning Engine",
+        ["🌟 Gemini AI Eraser (Recommended)", "🎨 Local OpenCV Filter (Offline)"],
+        help="Gemini AI detects exact handwriting coordinates and erases only the answers while keeping the original page image intact."
     )
 
     api_key = ""
     chosen_model = ""
     if "Gemini AI" in cleaning_engine:
-        # Check secrets / environment first
         default_key = os.environ.get("GEMINI_API_KEY", "")
         if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
             default_key = st.secrets["GEMINI_API_KEY"]
@@ -70,14 +61,13 @@ def main():
             "Gemini API Key",
             value=default_key,
             type="password",
-            help="Free key from Google AI Studio (no credit card required)."
+            help="Free API key from Google AI Studio."
         )
         st.sidebar.markdown(
             "👉 [Get a free key at Google AI Studio](https://aistudio.google.com/apikey)",
             unsafe_allow_html=True
         )
 
-        # Model Selection
         default_models = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-3.0-pro", "gemini-2.0-flash"]
         available_models = default_models
 
@@ -87,27 +77,11 @@ def main():
                 available_models = fetched
 
         chosen_model = st.sidebar.selectbox(
-            "Gemini Model",
+            "AI Model",
             options=available_models,
             index=0,
-            help="Flash is ultra-fast with high limits. Pro provides maximum accuracy for complex layouts."
+            help="Flash is ultra-fast with 1500 free requests/day. Pro offers maximum precision."
         )
-
-        with st.sidebar.expander("📊 Free Tier Limits & Model Info"):
-            st.markdown(
-                """
-                **⚡ Flash Models (e.g. 2.5 / 3.8 Flash):**
-                - **Limit:** ~15 Requests/Min (RPM), ~1,500 Requests/Day (RPD)
-                - **Best for:** Fast batch processing of standard worksheets.
-
-                **🧠 Pro Models (e.g. 2.5 / 3.0 Pro):**
-                - **Limit:** ~2–5 Requests/Min, ~50–100 Requests/Day
-                - **Best for:** Dense handwriting, difficult fonts, complex math.
-
-                **📱 Note on Gemini Nano:**
-                *Gemini Nano is Google's on-device model running locally inside Android AICore on Pixel/Samsung phones, which is why it has no public cloud REST API. The cloud Flash and Pro models are significantly larger, smarter, and more accurate!*
-                """
-            )
 
     else:
         cv_mode = st.sidebar.radio(
@@ -141,110 +115,60 @@ def main():
 
             progress_bar = st.progress(0)
             status_text = st.empty()
+            processed_images = []
 
-            # -------------------------------------------------
-            # 1. GEMINI AI MODE
-            # -------------------------------------------------
-            if "Gemini AI" in cleaning_engine:
-                pages_html = []
+            for i, file in enumerate(uploaded_files):
+                file_bytes = file.getvalue()
 
-                for i, file in enumerate(uploaded_files):
-                    status_text.text(f"🤖 AI processing page {i+1} of {len(uploaded_files)} using {chosen_model}...")
-                    file_bytes = file.getvalue()
-
-                    html_page, msg = cleaner.clean_with_gemini(file_bytes, api_key, chosen_model=chosen_model)
-
-                    if not html_page:
-                        st.error(f"Page {file.name}: {msg}")
-                        continue
-
-                    pages_html.append(html_page)
-
-                    if show_preview:
-                        st.markdown(f"#### 📄 Page {i+1}: {file.name}")
-                        col1, col2 = st.columns([1, 1])
-                        with col1:
-                            st.caption("Original Photo")
-                            st.image(file_bytes, use_container_width=True)
-                        with col2:
-                            st.caption("Clean Reconstructed Page")
-                            with st.container():
-                                st.markdown(
-                                    f"<div class='preview-box'>{html_page}</div>",
-                                    unsafe_allow_html=True
-                                )
-
-                    progress_bar.progress((i + 1) / len(uploaded_files))
-
-                if pages_html:
-                    status_text.text("✨ Generating high-resolution PDF...")
-                    pdf_bytes = cleaner.html_to_pdf(pages_html)
-
-                    st.success("✅ Clean PDF generated successfully!")
-                    st.download_button(
-                        label="📄 Download Cleaned PDF",
-                        data=pdf_bytes,
-                        file_name="clean_worksheets.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
+                # Process depending on engine
+                if "Gemini AI" in cleaning_engine:
+                    status_text.text(f"🤖 AI erasing answers from image {i+1} of {len(uploaded_files)} using {chosen_model}...")
+                    cleaned_bgr, msg = cleaner.clean_image_with_gemini_ai(file_bytes, api_key, chosen_model=chosen_model)
                 else:
-                    st.error("No pages were successfully processed.")
-
-            # -------------------------------------------------
-            # 2. LOCAL OPENCV MODE
-            # -------------------------------------------------
-            else:
-                processed_images = []
-
-                for i, file in enumerate(uploaded_files):
                     status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
-                    file_bytes = file.getvalue()
+                    cleaned_bgr, msg = cleaner.process_image(file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance)
 
-                    cleaned_bgr, msg = cleaner.process_image(
-                        file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance
-                    )
+                if cleaned_bgr is None:
+                    st.error(f"File {file.name}: {msg}")
+                    continue
 
-                    if cleaned_bgr is None:
-                        st.error(f"File {file.name}: {msg}")
-                        continue
+                if "Warning" in msg:
+                    st.warning(f"File {file.name}: {msg}")
 
-                    if "Warning" in msg:
-                        st.warning(f"File {file.name}: {msg}")
+                processed_images.append(cleaned_bgr)
 
-                    processed_images.append(cleaned_bgr)
+                # Show Side-by-Side Image Preview
+                if show_preview:
+                    st.markdown(f"**Preview: {file.name}**")
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        st.image(file_bytes, caption="Original Photo", use_container_width=True)
+                    with col2:
+                        cleaned_rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
+                        st.image(cleaned_rgb, caption="Cleaned Image (Answers Erased)", use_container_width=True)
 
-                    if show_preview:
-                        st.markdown(f"**Preview: {file.name}**")
-                        col1, col2 = st.columns([1, 1])
-                        with col1:
-                            st.image(file_bytes, caption="Original", use_container_width=True)
-                        with col2:
-                            cleaned_rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
-                            st.image(cleaned_rgb, caption="Cleaned", use_container_width=True)
+                progress_bar.progress((i + 1) / len(uploaded_files))
 
-                    progress_bar.progress((i + 1) / len(uploaded_files))
+            if processed_images:
+                status_text.text("✨ Compiling cleaned page images into PDF...")
+                pdf_bytes = cleaner.images_to_pdf(processed_images)
 
-                if processed_images:
-                    status_text.text("Processing complete! Generating PDF...")
-                    pdf_bytes = cleaner.images_to_pdf(processed_images)
-
-                    st.success("✅ PDF ready for download!")
-                    st.download_button(
-                        label="📄 Download Cleaned PDF",
-                        data=pdf_bytes,
-                        file_name="cleaned_worksheets.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    st.error("No images were successfully processed.")
+                st.success("✅ Clean PDF ready for download!")
+                st.download_button(
+                    label="📄 Download Cleaned PDF",
+                    data=pdf_bytes,
+                    file_name="cleaned_worksheets.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+            else:
+                st.error("No images were successfully processed.")
 
     st.markdown("---")
     st.markdown(
         """
         <div style='text-align: center; color: gray; font-size: 0.85em;'>
-            💡 <strong>Pro Tip:</strong> Gemini AI mode completely removes watermark overlays, desk shadows, and handwriting while leaving pristine blank exercise sheets for your little bro to re-solve!
+            💡 <strong>How it works:</strong> The AI precisely locates handwritten pen marks and erases them directly from your photos, preserving the original booklet layout, typography, and page numbers.
         </div>
         """,
         unsafe_allow_html=True
