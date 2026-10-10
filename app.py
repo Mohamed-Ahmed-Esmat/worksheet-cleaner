@@ -68,32 +68,32 @@ def main():
             unsafe_allow_html=True
         )
 
-        openrouter_models = [
-            "google/gemini-3-pro-image",
-            "google/gemini-nano-banana-2.1",
-            "google/gemini-3.1-flash-image",
-            "google/gemini-2.5-flash-image",
-            "openai/gpt-5-image",
-            "openai/gpt-5-image-mini",
-            "black-forest-labs/flux.2-pro",
-            "black-forest-labs/flux-1-dev",
-            "black-forest-labs/flux-1-schnell",
-            "qwen/qwen-2.5-vl-72b-instruct",
-            "qwen/qwen3-vl-8b-instruct",
-            "Custom Model...",
-        ]
+        model_options = {
+            "🍌 Nano Banana Pro (google/gemini-3-pro-image) [Recommended]": "google/gemini-3-pro-image",
+            "⚡ Nano Banana 2.1 (google/gemini-nano-banana-2.1) [Fast & Cheap]": "google/gemini-nano-banana-2.1",
+            "⚡ Gemini 3.1 Flash Image (google/gemini-3.1-flash-image)": "google/gemini-3.1-flash-image",
+            "⚡ Gemini 2.5 Flash Image (google/gemini-2.5-flash-image)": "google/gemini-2.5-flash-image",
+            "✨ OpenAI GPT-5 Image (openai/gpt-5-image)": "openai/gpt-5-image",
+            "✨ OpenAI GPT-5 Image Mini (openai/gpt-5-image-mini)": "openai/gpt-5-image-mini",
+            "🎨 FLUX 2 Pro (black-forest-labs/flux.2-pro) [Text-to-Image Only]": "black-forest-labs/flux.2-pro",
+            "🎨 FLUX 1 Dev (black-forest-labs/flux-1-dev) [Text-to-Image Only]": "black-forest-labs/flux-1-dev",
+            "🎨 FLUX 1 Schnell (black-forest-labs/flux-1-schnell) [Text-to-Image Only]": "black-forest-labs/flux-1-schnell",
+            "👁️ Qwen 2.5 VL 72B (qwen/qwen-2.5-vl-72b-instruct) [Vision-to-Text Only]": "qwen/qwen-2.5-vl-72b-instruct",
+            "👁️ Qwen 3 VL 8B (qwen/qwen3-vl-8b-instruct) [Vision-to-Text Only]": "qwen/qwen3-vl-8b-instruct",
+            "✏️ Custom Model ID...": "custom",
+        }
 
-        selected_option = st.sidebar.selectbox(
+        selected_label = st.sidebar.selectbox(
             "AI Model",
-            options=openrouter_models,
+            options=list(model_options.keys()),
             index=0,
-            help="Choose between Nano Banana Pro, GPT-5 Image, Flux, Qwen, or a custom model."
+            help="Select the AI model. For worksheets, use Image-to-Image models (Nano Banana Pro / Gemini / GPT-5 Image)."
         )
 
-        if selected_option == "Custom Model...":
+        if model_options[selected_label] == "custom":
             chosen_model = st.sidebar.text_input("Enter OpenRouter Model Slug", value="google/gemini-3-pro-image")
         else:
-            chosen_model = selected_option
+            chosen_model = model_options[selected_label]
 
         with st.sidebar.expander("ℹ️ Model Info & Modalities"):
             st.markdown(

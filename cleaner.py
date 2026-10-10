@@ -83,6 +83,13 @@ class WorksheetCleaner:
                     err_msg = err_json.get("error", {}).get("message", resp.text)
                 except Exception:
                     err_msg = resp.text
+
+                if "cannot be used with the chat/completions endpoint" in err_msg or "/api/v1/images endpoint instead" in err_msg:
+                    return None, (
+                        f"Model '{model}' is a Text-to-Image generation model (it only generates art from text prompts and cannot take photos as input).\n\n"
+                        "👉 To clean or regenerate a worksheet from a photo, choose an Image-to-Image model like 'google/gemini-3-pro-image' (Nano Banana Pro)."
+                    )
+
                 return None, f"OpenRouter API error ({resp.status_code}): {err_msg}"
 
             data = resp.json()
