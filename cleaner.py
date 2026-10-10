@@ -90,21 +90,14 @@ class WorksheetCleaner:
             if not choices:
                 return None, f"No response choices returned from OpenRouter: {data}"
 
-            message = choices[0].get("message", {})
-            content = message.get("content", "")
-
-            # Extract generated image bytes from response
-            cleaned_bytes = self.extract_image_bytes_from_content(content)
-            if not cleaned_bytes:
-                # Sometimes images are returned under message.parts or images array
-                if "images" in message and message["images"]:
-                    first_img = message["images"][0]
-                    cleaned_bytes = self.extract_image_bytes_from_content(first_img)
+            # Extract generated image bytes from OpenRouter response
+            cleaned_bytes = self.extract_image_bytes_from_response(data)
 
             if not cleaned_bytes:
-                # Check if it was returned as a text explanation
-                snippet = str(content)[:200]
-                return None, f"Model responded with text instead of image: {snippet}"
+                # Log snippet for debugging if image is missing
+                msg_obj = choices[0].get("message", {})
+                snippet = str(msg_obj)[:300]
+                return None, f"Could not find image in model response: {snippet}"
 
             # Convert image bytes to BGR numpy array
             nparr = np.frombuffer(cleaned_bytes, np.uint8)
@@ -120,55 +113,125 @@ class WorksheetCleaner:
         except Exception as e:
             return None, f"Request error: {str(e)}"
 
-    def extract_image_bytes_from_content(self, content) -> Optional[bytes]:
+    def extract_image_bytes_from_response(self, data: dict) -> Optional[bytes]:
         """
-        Parses base64 data URLs, http links, or raw base64 from OpenRouter response.
+        Extracts image bytes from all possible OpenRouter response structures:
+        1. OpenRouter Image API: data.data[0].b64_json or url
+        2. Chat completions: message.images[0].image_url.url
+        3. Chat completions: message.content (string or parts list)
         """
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    if "image_url" in part:
-                        url = part["image_url"].get("url", "")
-                        res = self.extract_image_bytes_from_content(url)
-                        if res: return res
-                    if "image" in part:
-                        res = self.extract_image_bytes_from_content(part["image"])
-                        if res: return res
+        # 1. OpenRouter /api/v1/images format
+        if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+            first = data["data"][0]
+            if isinstance(first, dict):
+                if "b64_json" in first and first["b64_json"]:
+                    return base64.b64decode(first["b64_json"])
+                if "url" in first and first["url"]:
+                    return self._fetch_or_decode_url(first["url"])
 
-        elif isinstance(content, str):
-            # 1. Base64 data URL pattern
-            m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", content)
-            if m:
+        # 2. Chat completions format
+        choices = data.get("choices", [])
+        if choices and isinstance(choices, list):
+            msg = choices[0].get("message", {})
+
+            # Priority A: msg.images (OpenRouter image generation standard)
+            images = msg.get("images", [])
+            if images and isinstance(images, list):
+                for img_item in images:
+                    res = self._parse_image_item(img_item)
+                    if res:
+                        return res
+
+            # Priority B: choices[0].images
+            choice_images = choices[0].get("images", [])
+            if choice_images and isinstance(choice_images, list):
+                for img_item in choice_images:
+                    res = self._parse_image_item(img_item)
+                    if res:
+                        return res
+
+            # Priority C: msg.content
+            content = msg.get("content")
+            if content:
+                res = self._parse_image_item(content)
+                if res:
+                    return res
+
+        return None
+
+    def _parse_image_item(self, item) -> Optional[bytes]:
+        """
+        Recursively extracts image bytes from an item (dict, list, or string).
+        """
+        if isinstance(item, dict):
+            if "image_url" in item:
+                val = item["image_url"]
+                if isinstance(val, dict):
+                    return self._fetch_or_decode_url(val.get("url", ""))
+                elif isinstance(val, str):
+                    return self._fetch_or_decode_url(val)
+            if "url" in item:
+                return self._fetch_or_decode_url(item["url"])
+            if "b64_json" in item and item["b64_json"]:
                 try:
-                    return base64.b64decode(m.group(1))
+                    return base64.b64decode(item["b64_json"])
                 except Exception:
                     pass
+            if "image" in item:
+                return self._parse_image_item(item["image"])
 
-            # 2. Markdown image URL pattern ![...](https://...)
-            m_url = re.search(r"!\[.*?\]\((https?://[^\s\)]+)\)", content)
-            if m_url:
-                try:
-                    img_resp = requests.get(m_url.group(1), timeout=30)
-                    if img_resp.status_code == 200:
-                        return img_resp.content
-                except Exception:
-                    pass
+        elif isinstance(item, list):
+            for sub in item:
+                res = self._parse_image_item(sub)
+                if res:
+                    return res
 
-            # 3. Direct HTTP URL
-            if content.startswith("http://") or content.startswith("https://"):
-                try:
-                    img_resp = requests.get(content.strip(), timeout=30)
-                    if img_resp.status_code == 200:
-                        return img_resp.content
-                except Exception:
-                    pass
+        elif isinstance(item, str):
+            return self._fetch_or_decode_url(item)
 
-            # 4. Raw base64 string
-            if len(content) > 1000 and not content.startswith("{") and not content.startswith("<"):
-                try:
-                    return base64.b64decode(content.strip())
-                except Exception:
-                    pass
+        return None
+
+    def _fetch_or_decode_url(self, s: str) -> Optional[bytes]:
+        """
+        Decodes base64 data URL or downloads remote HTTP image URL.
+        """
+        if not s or not isinstance(s, str):
+            return None
+        s = s.strip()
+
+        # Data URL
+        m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=]+)", s)
+        if m:
+            try:
+                return base64.b64decode(m.group(1))
+            except Exception:
+                pass
+
+        # Markdown image ![...](https://...)
+        m_md = re.search(r"!\[.*?\]\((https?://[^\s\)]+)\)", s)
+        if m_md:
+            try:
+                resp = requests.get(m_md.group(1), timeout=30)
+                if resp.status_code == 200:
+                    return resp.content
+            except Exception:
+                pass
+
+        # Direct HTTP/HTTPS URL
+        if s.startswith("http://") or s.startswith("https://"):
+            try:
+                resp = requests.get(s, timeout=30)
+                if resp.status_code == 200:
+                    return resp.content
+            except Exception:
+                pass
+
+        # Raw base64 string
+        if len(s) > 1000 and not s.startswith("<") and not s.startswith("{"):
+            try:
+                return base64.b64decode(s)
+            except Exception:
+                pass
 
         return None
 
