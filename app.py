@@ -101,7 +101,24 @@ def main():
                 """
             )
 
+        with st.sidebar.expander("✏️ View / Customize AI Prompt"):
+            ai_prompt = st.text_area(
+                "Prompt Instructions",
+                value=(
+                    "Clean and regenerate this school worksheet page as a clean, high-contrast digital image.\n"
+                    "Preserve 100% of all printed content: keep all printed text, headings, exercise instructions, "
+                    "vocabulary, grammar tables, question numbers, and dotted lines completely intact and unchanged.\n"
+                    "CRITICAL: Erase and remove ONLY the handwritten pen/pencil answers, markings, and student doodles.\n"
+                    "Ensure the answer spaces (dotted lines, blank lines, empty table cells) are clean, blank, and empty so a student can re-practice.\n"
+                    "Remove any background desk shadows, page skew, or diagonal watermarks.\n"
+                    "Output the result as a clear, crisp printable worksheet image."
+                ),
+                height=180,
+                help="You can customize instructions here if you want specific rules for your worksheets."
+            )
+        default_ai_prompt = ai_prompt
     else:
+        default_ai_prompt = ""
         cv_mode = st.sidebar.radio(
             "Detection Mode",
             ["Blue Pen Removal", "Auto-Detect (Any Color)"],
@@ -141,10 +158,10 @@ def main():
                 if "AI Image Regeneration" in cleaning_engine:
                     status_text.text(f"🎨 Regenerating clean image {i+1} of {len(uploaded_files)} using {chosen_model}...")
                     if hasattr(cleaner, "regenerate_image_with_ai"):
-                        cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
+                        cleaned_bgr, msg = cleaner.regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt)
                     else:
                         from cleaner import WorksheetCleaner
-                        cleaned_bgr, msg = WorksheetCleaner().regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model)
+                        cleaned_bgr, msg = WorksheetCleaner().regenerate_image_with_ai(file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt)
                 else:
                     status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
                     cleaned_bgr, msg = cleaner.process_image(file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance)
