@@ -104,16 +104,8 @@ def main():
         with st.sidebar.expander("✏️ View / Customize AI Prompt"):
             ai_prompt = st.text_area(
                 "Prompt Instructions",
-                value=(
-                    "Clean and regenerate this school worksheet page as a clean, high-contrast digital image.\n"
-                    "Preserve 100% of all printed content: keep all printed text, headings, exercise instructions, "
-                    "vocabulary, grammar tables, question numbers, and dotted lines completely intact and unchanged.\n"
-                    "CRITICAL: Erase and remove ONLY the handwritten pen/pencil answers, markings, and student doodles.\n"
-                    "Ensure the answer spaces (dotted lines, blank lines, empty table cells) are clean, blank, and empty so a student can re-practice.\n"
-                    "Remove any background desk shadows, page skew, or diagonal watermarks.\n"
-                    "Output the result as a clear, crisp printable worksheet image."
-                ),
-                height=180,
+                value="Remove all handwritten pen answers from this image and return the clean questions only.",
+                height=100,
                 help="You can customize instructions here if you want specific rules for your worksheets."
             )
         default_ai_prompt = ai_prompt

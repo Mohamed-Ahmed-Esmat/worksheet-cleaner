@@ -78,15 +78,7 @@ class WorksheetCleaner:
 
         client = genai.Client(api_key=api_key.strip())
 
-        default_prompt = (
-            "Clean and regenerate this school worksheet page as a clean, high-contrast digital image.\n"
-            "Preserve 100% of all printed content: keep all printed text, headings, exercise instructions, "
-            "vocabulary, grammar tables, question numbers, and dotted lines completely intact and unchanged.\n"
-            "CRITICAL: Erase and remove ONLY the handwritten pen/pencil answers, markings, and student doodles.\n"
-            "Ensure the answer spaces (dotted lines, blank lines, empty table cells) are clean, blank, and empty so a student can re-practice.\n"
-            "Remove any background desk shadows, page skew, or diagonal watermarks.\n"
-            "Output the result as a clear, crisp printable worksheet image."
-        )
+        default_prompt = "Remove all handwritten pen answers from this image and return the clean questions only."
 
         prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else default_prompt
 
