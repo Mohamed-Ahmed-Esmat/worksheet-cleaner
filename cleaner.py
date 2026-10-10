@@ -23,6 +23,40 @@ class WorksheetCleaner:
         self.default_blue_lower = np.array([90, 50, 50])
         self.default_blue_upper = np.array([130, 255, 255])
 
+    @staticmethod
+    def normalize_image_bytes(raw_bytes: bytes, max_dim: int = 2048) -> bytes:
+        """
+        Converts HEIC/HEIF/PNG/WEBP/etc. to standard RGB JPEG, fixes EXIF orientation
+        (critical for mobile phone camera shots), and resizes gigantic photos
+        to avoid payload size errors or mobile browser memory crashes.
+        """
+        try:
+            try:
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+            except Exception:
+                pass
+
+            img = Image.open(io.BytesIO(raw_bytes))
+
+            # Auto-orient based on mobile camera EXIF orientation tag
+            from PIL import ImageOps
+            img = ImageOps.exif_transpose(img)
+
+            # Ensure RGB mode (handles RGBA, P, CMYK, etc.)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # Scale down if gigantic (e.g. 48MP mobile cameras)
+            if max(img.size) > max_dim:
+                img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            return buf.getvalue()
+        except Exception:
+            return raw_bytes
+
     # ---------------------------------------------------------
     # 1. OPENROUTER API (NANO BANANA PRO & GEMINI IMAGE MODELS)
     # ---------------------------------------------------------
@@ -48,8 +82,11 @@ class WorksheetCleaner:
         default_prompt = "Remove all handwritten pen answers from this image and return the clean questions only."
         prompt = custom_prompt.strip() if custom_prompt and custom_prompt.strip() else default_prompt
 
+        # Normalize format (HEIC -> JPEG), orient correctly, and resize if huge
+        norm_bytes = self.normalize_image_bytes(img_bytes)
+
         # Encode image to base64
-        b64_image = base64.b64encode(img_bytes).decode("utf-8")
+        b64_image = base64.b64encode(norm_bytes).decode("utf-8")
         data_url = f"data:image/jpeg;base64,{b64_image}"
 
         url = "https://openrouter.ai/api/v1/chat/completions"
@@ -310,7 +347,8 @@ class WorksheetCleaner:
 
     def process_image(self, img_bytes: bytes, mode: str, sensitivity: float, enhance: bool) -> Tuple[Optional[np.ndarray], str]:
         try:
-            nparr = np.frombuffer(img_bytes, np.uint8)
+            norm_bytes = self.normalize_image_bytes(img_bytes)
+            nparr = np.frombuffer(norm_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
                 return None, "Error: Could not decode image."

@@ -5,4 +5,8 @@ secondaryBackgroundColor = "#F5F5F5"
 textColor = "#212121"
 
 [server]
-maxUploadSize = 50
+maxUploadSize = 200
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false

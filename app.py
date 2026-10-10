@@ -141,16 +141,40 @@ def main():
 
     show_preview = st.sidebar.toggle("Show before / after preview", value=True)
 
-    # Main Uploader
-    uploaded_files = st.file_uploader(
-        "Upload Worksheet Photos",
-        type=['jpg', 'jpeg', 'png', 'webp'],
-        accept_multiple_files=True,
-        help="Take photos of completed booklet pages and upload them all together."
-    )
+    # Upload Options: Gallery or Camera
+    upload_tab, camera_tab = st.tabs(["📁 Choose Photos (Gallery)", "📸 Take Photo with Camera"])
 
+    with upload_tab:
+        uploaded_files = st.file_uploader(
+            "Select Worksheet Photos",
+            type=['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'],
+            accept_multiple_files=True,
+            key="mobile_file_uploader",
+            help="Select photos from your phone gallery. Supports JPG, PNG, WEBP, and iPhone HEIC."
+        )
+
+    with camera_tab:
+        camera_file = st.camera_input("Take a photo of a worksheet page", key="mobile_camera_input")
+
+    # Aggregate images from both sources
+    all_uploads = []
     if uploaded_files:
-        st.caption(f"📁 {len(uploaded_files)} image(s) selected")
+        for f in uploaded_files:
+            all_uploads.append((f.name, f.getvalue()))
+    if camera_file:
+        all_uploads.append(("camera_photo.jpg", camera_file.getvalue()))
+
+    if all_uploads:
+        st.success(f"✅ **{len(all_uploads)} page(s) ready for cleaning!**")
+
+        st.markdown("##### 📸 Uploaded Pages Preview:")
+        preview_cols = st.columns(min(len(all_uploads), 3) if len(all_uploads) > 1 else 1)
+        for idx, (fname, raw_bytes) in enumerate(all_uploads):
+            with preview_cols[idx % len(preview_cols)]:
+                thumb_bytes = cleaner.normalize_image_bytes(raw_bytes, max_dim=450)
+                st.image(thumb_bytes, caption=f"Page {idx+1}: {fname}", use_container_width=True)
+
+        st.markdown("---")
 
         if st.button("🧹 Regenerate Clean Pages & PDF", type="primary", use_container_width=True):
             if "OpenRouter" in cleaning_engine and not api_key.strip():
@@ -161,40 +185,39 @@ def main():
             status_text = st.empty()
             processed_images = []
 
-            for i, file in enumerate(uploaded_files):
-                file_bytes = file.getvalue()
-
+            for i, (fname, file_bytes) in enumerate(all_uploads):
                 if "OpenRouter" in cleaning_engine:
-                    status_text.text(f"🎨 Nano Banana Pro regenerating image {i+1} of {len(uploaded_files)}...")
+                    status_text.text(f"🎨 Nano Banana Pro regenerating page {i+1} of {len(all_uploads)}...")
                     cleaned_bgr, msg = cleaner.regenerate_image_with_openrouter(
                         file_bytes, api_key, chosen_model=chosen_model, custom_prompt=default_ai_prompt
                     )
                 else:
-                    status_text.text(f"Processing image {i+1} of {len(uploaded_files)}...")
+                    status_text.text(f"Processing page {i+1} of {len(all_uploads)}...")
                     cleaned_bgr, msg = cleaner.process_image(
                         file_bytes, mode=cv_mode, sensitivity=sensitivity, enhance=enhance
                     )
 
                 if cleaned_bgr is None:
-                    st.error(f"File {file.name}: {msg}")
+                    st.error(f"Page {i+1} ({fname}): {msg}")
                     continue
 
                 if "Warning" in msg:
-                    st.warning(f"File {file.name}: {msg}")
+                    st.warning(f"Page {i+1} ({fname}): {msg}")
 
                 processed_images.append(cleaned_bgr)
 
                 # Show Side-by-Side Image Preview
                 if show_preview:
-                    st.markdown(f"**Page {i+1}: {file.name}**")
+                    st.markdown(f"**Page {i+1}: {fname}**")
                     col1, col2 = st.columns([1, 1])
                     with col1:
-                        st.image(file_bytes, caption="Original Uploaded Photo", use_container_width=True)
+                        orig_preview = cleaner.normalize_image_bytes(file_bytes, max_dim=800)
+                        st.image(orig_preview, caption="Original Uploaded Photo", use_container_width=True)
                     with col2:
                         cleaned_rgb = cv2.cvtColor(cleaned_bgr, cv2.COLOR_BGR2RGB)
-                        st.image(cleaned_rgb, caption="✨ Nano Banana Pro Cleaned Image", use_container_width=True)
+                        st.image(cleaned_rgb, caption="✨ Cleaned Output", use_container_width=True)
 
-                progress_bar.progress((i + 1) / len(uploaded_files))
+                progress_bar.progress((i + 1) / len(all_uploads))
 
             if processed_images:
                 status_text.text("📄 Assembling clean images into printable PDF...")
