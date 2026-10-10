@@ -130,11 +130,17 @@ class WorksheetCleaner:
                 last_error = f"{model_name}: {str(e)}"
                 continue
 
-        # Attempt 2: If image generation modality isn't supported on current key,
-        # fallback to high-precision coordinate inpainting
-        fallback_img, fallback_msg = self.fallback_coordinate_inpaint(img_bytes, client)
-        if fallback_img is not None:
-            return fallback_img, f"Regenerated via AI Inpainting (image model fallback: {last_error})"
+        # Format helpful message for known errors
+        if "limit: 0" in last_error or "RESOURCE_EXHAUSTED" in last_error:
+            return None, (
+                "Google Quota Limit (FreeTier limit is 0 for image synthesis). "
+                "To use native image generation, please enable Pay-as-you-go billing on your Google AI Studio project at aistudio.google.com."
+            )
+        elif "not available in your country" in last_error:
+            return None, (
+                "Image generation is geo-blocked by Google for local Egyptian IP addresses. "
+                "Run this on your deployed Streamlit Cloud app (hosted on US AWS servers) to bypass the restriction."
+            )
 
         return None, f"Image regeneration failed: {last_error}"
 
