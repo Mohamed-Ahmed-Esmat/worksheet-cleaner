@@ -9,12 +9,14 @@ clean pages into a PDF. Engines:
 - Local OpenCV Filter: offline color filter.
 """
 
-import streamlit as st
 import hashlib
 import os
 from datetime import datetime, timedelta, timezone
+
 import cv2
 import numpy as np
+import streamlit as st
+
 import handwriting_eraser
 import retypeset
 from cleaner import DEFAULT_REGEN_MODEL, WorksheetCleaner
@@ -104,8 +106,8 @@ def exhausted_models(api_key: str) -> set:
 
 def retype_one_page(
     page_no: int, fname: str, file_bytes: bytes, api_key: str, verify: bool, show_preview: bool
-) -> str:
-    """Re-typesets one photo, shows notes/warnings/preview, and returns its HTML ("" on failure)."""
+) -> bytes:
+    """Re-typesets one photo, shows notes/warnings/preview, and returns its PDF (b"" on failure)."""
     page_bytes = cleaner.normalize_image_bytes(file_bytes)
     skip = exhausted_models(api_key)
     try:
@@ -113,21 +115,26 @@ def retype_one_page(
     except retypeset.RetypeError as e:
         skip.update(e.exhausted)
         st.error(f"Page {page_no} ({fname}): {e}")
-        return ""
+        return b""
     skip.update(result.exhausted)
 
     # Render the page on its own first: the preview needs it, and a page that
     # cannot be rendered must not break the PDF of the other pages.
     try:
-        page_pdf = retypeset.render_pdf([result.html])
+        page_pdf = retypeset.render_page(result.html)
     except RuntimeError as e:
         st.error(f"Page {page_no} ({fname}): could not lay out the page, so it is left out ({e}).")
-        return ""
+        return b""
 
     checked = f", checked by {result.verify_model}" if result.verify_model else ""
     st.caption(f"Page {page_no}: read by {result.model}{checked}.")
     for note in result.notes:
         st.info(f"Page {page_no}: {note}")
+    if verify and not result.verify_model:
+        st.warning(
+            f"Page {page_no} ({fname}): the text was read by one model only, so misread words "
+            "could not be caught. Compare the page with the photo before printing."
+        )
     if result.flagged:
         st.warning(
             f"Page {page_no} ({fname}): the two readers disagree on {len(result.flagged)} line(s). "
@@ -142,11 +149,28 @@ def retype_one_page(
             hide_index=True,
             use_container_width=True,
         )
-    if result.figures:
+    copied = [n for n, f in enumerate(result.figures, 1) if f.embedded]
+    marked = [n for n, f in enumerate(result.figures, 1) if f.embedded and f.has_handwriting]
+    unsure = [n for n, f in enumerate(result.figures, 1)
+              if f.embedded and f.has_handwriting is None]
+    missing = [n for n, f in enumerate(result.figures, 1) if not f.embedded]
+    if copied:
+        st.info(f"Page {page_no}: {len(copied)} picture(s) copied from the photo.")
+    if marked:
         st.warning(
-            f"Page {page_no} ({fname}): {len(result.figures)} picture(s) are shown as "
-            "\"[picture]\" because pictures are not copied yet. Use Detect & Erase for this page "
-            "if it needs them."
+            f"Page {page_no} ({fname}): picture(s) {', '.join(map(str, marked))} have the "
+            "student's marks on them, which are copied too. Check them, or use Detect & Erase "
+            "for this page."
+        )
+    if unsure:
+        st.warning(
+            f"Page {page_no} ({fname}): check picture(s) {', '.join(map(str, unsure))} for the "
+            "student's marks; the model did not say whether there are any."
+        )
+    if missing:
+        st.warning(
+            f"Page {page_no} ({fname}): {len(missing)} picture(s) could not be located and are "
+            "shown as \"[picture]\". Use Detect & Erase for this page if it needs them."
         )
 
     if show_preview:
@@ -163,7 +187,7 @@ def retype_one_page(
                 previews = []
             for png in previews:
                 st.image(png, caption="✨ Re-typeset page", use_container_width=True)
-    return result.html
+    return page_pdf
 
 
 def main():
@@ -363,15 +387,15 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
             processed_images = []
-            retyped_pages = []
+            retyped_pdfs = []
 
             for i, (fname, file_bytes) in enumerate(all_uploads):
                 marks = []
                 if cleaning_engine == ENGINE_RETYPE:
                     status_text.text(f"📄 Reading page {i+1} of {len(all_uploads)}...")
-                    page_html = retype_one_page(i + 1, fname, file_bytes, api_key, verify_text, show_preview)
-                    if page_html:
-                        retyped_pages.append(page_html)
+                    page_pdf = retype_one_page(i + 1, fname, file_bytes, api_key, verify_text, show_preview)
+                    if page_pdf:
+                        retyped_pdfs.append(page_pdf)
                     progress_bar.progress((i + 1) / len(all_uploads))
                     continue
                 if cleaning_engine == ENGINE_DETECT:
@@ -421,12 +445,12 @@ def main():
 
                 progress_bar.progress((i + 1) / len(all_uploads))
 
-            if retyped_pages or processed_images:
+            if retyped_pdfs or processed_images:
                 status_text.text("📄 Assembling clean pages into printable PDF...")
-                if retyped_pages:
-                    try:
-                        pdf_bytes = retypeset.render_pdf(retyped_pages)
-                    except RuntimeError as e:
+                if retyped_pdfs:
+                    try:  # each page was already rendered (and checked) on its own
+                        pdf_bytes = retypeset.merge_pdfs(retyped_pdfs)
+                    except RuntimeError as e:  # PdfiumError is a RuntimeError
                         st.error(f"Could not build the PDF: {e}")
                         return
                 else:
