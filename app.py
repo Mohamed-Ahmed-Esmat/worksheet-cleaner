@@ -2,18 +2,24 @@
 Streamlit Web Application for Worksheet Cleaner.
 Mobile-first UI to upload photos, erase handwritten answers, and compile the
 clean pages into a PDF. Engines:
-- Detect & Erase (default): a cheap vision model finds the handwriting, OpenCV erases it.
+- Re-typeset (default): a free vision model reads only the printed text, which is
+  re-typeset as a crisp PDF; a second model double-checks the text.
+- Detect & Erase: a cheap vision model finds the handwriting, OpenCV erases it.
 - AI Regeneration: an image model redraws the whole page (OpenRouter).
 - Local OpenCV Filter: offline color filter.
 """
 
 import streamlit as st
+import hashlib
 import os
+from datetime import datetime, timedelta, timezone
 import cv2
 import numpy as np
 import handwriting_eraser
+import retypeset
 from cleaner import DEFAULT_REGEN_MODEL, WorksheetCleaner
 
+ENGINE_RETYPE = "📄 Re-typeset (free, crisp text, new layout)"
 ENGINE_DETECT = "🔍 Detect & Erase (cheap, keeps printed text exact)"
 ENGINE_REGENERATE = "🍌 AI Regeneration (Nano Banana 2.1, redraws page)"
 ENGINE_OPENCV = "🎨 Local OpenCV Filter (Offline)"
@@ -84,6 +90,82 @@ def api_key_input(provider: str) -> str:
     return typed.strip() or server_key
 
 
+def exhausted_models(api_key: str) -> set:
+    """
+    Models whose daily free quota this key has used up today. Gemini quotas reset
+    at midnight Pacific time (approximated as UTC-8), and belong to one key, so a
+    new key or a new day starts with every model available again.
+    """
+    day = datetime.now(timezone(timedelta(hours=-8))).date().isoformat()
+    key_id = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    store = st.session_state.setdefault("retype_exhausted", {})
+    return store.setdefault((key_id, day), set())
+
+
+def retype_one_page(
+    page_no: int, fname: str, file_bytes: bytes, api_key: str, verify: bool, show_preview: bool
+) -> str:
+    """Re-typesets one photo, shows notes/warnings/preview, and returns its HTML ("" on failure)."""
+    page_bytes = cleaner.normalize_image_bytes(file_bytes)
+    skip = exhausted_models(api_key)
+    try:
+        result = retypeset.transcribe_page(page_bytes, api_key, verify=verify, skip=skip)
+    except retypeset.RetypeError as e:
+        skip.update(e.exhausted)
+        st.error(f"Page {page_no} ({fname}): {e}")
+        return ""
+    skip.update(result.exhausted)
+
+    # Render the page on its own first: the preview needs it, and a page that
+    # cannot be rendered must not break the PDF of the other pages.
+    try:
+        page_pdf = retypeset.render_pdf([result.html])
+    except RuntimeError as e:
+        st.error(f"Page {page_no} ({fname}): could not lay out the page, so it is left out ({e}).")
+        return ""
+
+    checked = f", checked by {result.verify_model}" if result.verify_model else ""
+    st.caption(f"Page {page_no}: read by {result.model}{checked}.")
+    for note in result.notes:
+        st.info(f"Page {page_no}: {note}")
+    if result.flagged:
+        st.warning(
+            f"Page {page_no} ({fname}): the two readers disagree on {len(result.flagged)} line(s). "
+            "Check these against the photo before printing; the PDF uses the first reading."
+        )
+        # A dataframe shows the model's text verbatim (st.warning would render it as markdown).
+        st.dataframe(
+            {
+                "In the PDF": [d.primary or "(missing)" for d in result.flagged],
+                "Second reading": [d.secondary or "(missing)" for d in result.flagged],
+            },
+            hide_index=True,
+            use_container_width=True,
+        )
+    if result.figures:
+        st.warning(
+            f"Page {page_no} ({fname}): {len(result.figures)} picture(s) are shown as "
+            "\"[picture]\" because pictures are not copied yet. Use Detect & Erase for this page "
+            "if it needs them."
+        )
+
+    if show_preview:
+        st.markdown(f"**Page {page_no}: {fname}**")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.image(cleaner.normalize_image_bytes(file_bytes, max_dim=800),
+                     caption="Original Uploaded Photo", use_container_width=True)
+        with col2:
+            try:
+                previews = retypeset.render_preview(page_pdf, scale=1.0)
+            except (RuntimeError, ImportError) as e:  # preview only; PdfiumError is a RuntimeError
+                st.warning(f"Preview unavailable: {e}")
+                previews = []
+            for png in previews:
+                st.image(png, caption="✨ Re-typeset page", use_container_width=True)
+    return result.html
+
+
 def main():
     st.title("📝 Worksheet Cleaner")
     st.markdown("Regenerate clean assignment images without answers — upload photos, get a clean printable PDF.")
@@ -93,20 +175,39 @@ def main():
 
     cleaning_engine = st.sidebar.radio(
         "Cleaning Engine",
-        [ENGINE_DETECT, ENGINE_REGENERATE, ENGINE_OPENCV],
+        [ENGINE_RETYPE, ENGINE_DETECT, ENGINE_REGENERATE, ENGINE_OPENCV],
         help=(
+            "Re-typeset: a free vision model reads only the printed text and it is re-typeset as a "
+            "crisp, perfectly clean page (original fonts and positions are not kept). "
             "Detect & Erase: a cheap vision model (~$0.002/page) only finds the handwriting; "
             "it is erased locally, so printed text is never changed. "
             "AI Regeneration: an image model redraws the whole page (~$0.03/page with Nano Banana 2.1) and may alter printed text."
         ),
     )
-    needs_api_key = cleaning_engine in (ENGINE_DETECT, ENGINE_REGENERATE)
+    needs_api_key = cleaning_engine in (ENGINE_RETYPE, ENGINE_DETECT, ENGINE_REGENERATE)
 
     api_key = ""
     chosen_model = ""
     default_ai_prompt = ""
 
-    if cleaning_engine == ENGINE_DETECT:
+    if cleaning_engine == ENGINE_RETYPE:
+        api_key = api_key_input(handwriting_eraser.PROVIDER_GEMINI)
+        provider_name = "Gemini"
+        verify_text = st.sidebar.toggle(
+            "Double-check text with a second model", value=True,
+            help=(
+                "Reads every page twice with two different models and lists any line they read "
+                "differently, e.g. a word hidden under a student's circle. Uses two free requests per page."
+            ),
+        )
+        st.sidebar.caption(
+            "Models: " + " → ".join(retypeset.RETYPE_CHAIN) + ". When one runs out of free quota "
+            "(Robotics-ER: ~20 pages/day) the next one is used. On the free tier Google may use "
+            "uploads to improve its products; use a paid key for students' work if that matters "
+            "(~$0.005/page)."
+        )
+
+    elif cleaning_engine == ENGINE_DETECT:
         provider_labels = {
             "Gemini API (free tier)": handwriting_eraser.PROVIDER_GEMINI,
             "OpenRouter (paid, no geo-blocks)": handwriting_eraser.PROVIDER_OPENROUTER,
@@ -262,9 +363,17 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
             processed_images = []
+            retyped_pages = []
 
             for i, (fname, file_bytes) in enumerate(all_uploads):
                 marks = []
+                if cleaning_engine == ENGINE_RETYPE:
+                    status_text.text(f"📄 Reading page {i+1} of {len(all_uploads)}...")
+                    page_html = retype_one_page(i + 1, fname, file_bytes, api_key, verify_text, show_preview)
+                    if page_html:
+                        retyped_pages.append(page_html)
+                    progress_bar.progress((i + 1) / len(all_uploads))
+                    continue
                 if cleaning_engine == ENGINE_DETECT:
                     status_text.text(f"🔍 Finding handwriting on page {i+1} of {len(all_uploads)}...")
                     page_bytes = cleaner.normalize_image_bytes(file_bytes)
@@ -312,9 +421,16 @@ def main():
 
                 progress_bar.progress((i + 1) / len(all_uploads))
 
-            if processed_images:
-                status_text.text("📄 Assembling clean images into printable PDF...")
-                pdf_bytes = cleaner.images_to_pdf(processed_images)
+            if retyped_pages or processed_images:
+                status_text.text("📄 Assembling clean pages into printable PDF...")
+                if retyped_pages:
+                    try:
+                        pdf_bytes = retypeset.render_pdf(retyped_pages)
+                    except RuntimeError as e:
+                        st.error(f"Could not build the PDF: {e}")
+                        return
+                else:
+                    pdf_bytes = cleaner.images_to_pdf(processed_images)
 
                 st.success("✅ Clean PDF ready for download!")
                 st.download_button(
@@ -322,16 +438,17 @@ def main():
                     data=pdf_bytes,
                     file_name="cleaned_worksheets.pdf",
                     mime="application/pdf",
-                    use_container_width=True
+                    use_container_width=True,
+                    on_click="ignore",  # keep the warnings and previews on screen
                 )
             else:
-                st.error("No images were successfully processed.")
+                st.error("No pages were successfully processed.")
 
     st.markdown("---")
     st.markdown(
         """
         <div style='text-align: center; color: gray; font-size: 0.85em;'>
-            💡 <strong>Detect &amp; Erase:</strong> a vision model finds the handwritten answers and they are erased locally, so the printed questions stay exactly as in your photo.
+            💡 <strong>Re-typeset:</strong> a free vision model reads only the printed questions and they are set again as a crisp, answer-free page; a second model double-checks the text.
         </div>
         """,
         unsafe_allow_html=True
