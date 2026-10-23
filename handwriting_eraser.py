@@ -22,7 +22,6 @@ The model also labels each box:
 
 import base64
 import re
-import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -30,11 +29,11 @@ import cv2
 import numpy as np
 import requests
 
+from gemini_client import GeminiError, call_gemini, image_part
+
 PROVIDER_GEMINI = "gemini"          # Google Gemini API directly (has a free tier)
 PROVIDER_OPENROUTER = "openrouter"  # same models via OpenRouter (paid, no geo-blocks)
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_GEMINI_RETRY_DELAYS = (2, 5, None)  # seconds before each retry; None = last attempt
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_DETECTOR_MODEL = "google/gemini-3.5-flash-lite"
 
@@ -98,53 +97,18 @@ def detect_marks(
 
 
 def _detect_with_gemini(jpeg_bytes: bytes, api_key: str, model: str) -> str:
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": base64.b64encode(jpeg_bytes).decode(),
-                        }
-                    },
-                    {"text": DETECTION_PROMPT},
-                ]
-            }
-        ],
-        "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
-    }
-    # The free tier often answers 503 "high demand" for a few seconds: retry.
-    for delay in _GEMINI_RETRY_DELAYS:
-        resp = requests.post(
-            GEMINI_URL.format(model=model),
-            headers={"x-goog-api-key": api_key.strip()},
-            json=payload,
+    try:
+        return call_gemini(
+            [image_part(jpeg_bytes), {"text": DETECTION_PROMPT}],
+            api_key,
+            model,
+            {"temperature": 0, "response_mime_type": "application/json"},
             timeout=120,
         )
-        if resp.status_code not in (500, 502, 503, 504) or delay is None:
-            break
-        time.sleep(delay)
-    if resp.status_code != 200:
-        try:
-            err = resp.json().get("error", {}).get("message", resp.text)
-        except ValueError:
-            err = resp.text
-        if resp.status_code == 429:
-            raise RuntimeError(
-                f"Gemini rate limit reached (429): {err} "
-                "Free-tier limits reset per minute and per day; wait and retry, "
-                "or switch the provider to OpenRouter."
-            )
-        raise RuntimeError(f"Gemini API error ({resp.status_code}): {err}")
-
-    data = resp.json()
-    candidates = data.get("candidates") or []
-    if not candidates:
-        reason = data.get("promptFeedback", {}).get("blockReason", "no candidates returned")
-        raise RuntimeError(f"Gemini returned no answer: {reason}")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    except GeminiError as e:
+        if e.is_quota:
+            raise GeminiError(f"{e} Wait and retry, or switch the provider to OpenRouter.", 429) from e
+        raise
 
 
 def _detect_with_openrouter(jpeg_bytes: bytes, api_key: str, model: str) -> str:

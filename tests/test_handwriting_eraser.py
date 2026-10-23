@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import requests
 
+import gemini_client
 import handwriting_eraser as he
 
 PAPER = (205, 210, 215)  # slightly tinted, like a real photo (BGR)
@@ -248,7 +249,7 @@ def test_gemini_retries_temporary_overload(page_jpeg):
     busy.json.return_value = {"error": {"message": "high demand"}}
     ok = gemini_response('{"marks": []}')
     with mock.patch.object(he.requests, "post", side_effect=[busy, ok]) as post, \
-            mock.patch.object(he.time, "sleep") as sleep:
+            mock.patch.object(gemini_client.time, "sleep") as sleep:
         assert he.detect_marks(page_jpeg, "k", provider=he.PROVIDER_GEMINI) == '{"marks": []}'
     assert post.call_count == 2 and sleep.call_count == 1
 
@@ -257,7 +258,7 @@ def test_gemini_gives_up_after_repeated_overload(page_jpeg):
     busy = gemini_response("", status=503)
     busy.json.return_value = {"error": {"message": "high demand"}}
     with mock.patch.object(he.requests, "post", return_value=busy) as post, \
-            mock.patch.object(he.time, "sleep"):
+            mock.patch.object(gemini_client.time, "sleep"):
         cleaned, _, msg = he.detect_and_erase(page_jpeg, "k", provider=he.PROVIDER_GEMINI)
     assert cleaned is None and "503" in msg
-    assert post.call_count == len(he._GEMINI_RETRY_DELAYS)
+    assert post.call_count == len(gemini_client.RETRY_DELAYS)
