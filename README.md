@@ -16,7 +16,8 @@ The app has three cleaning engines (pick one in the sidebar):
    - **mark** (circle/underline over printed text): only pen-colored pixels are erased, so the
      printed word underneath stays.
    An optional "scanned look" evens out the lighting so the paper prints white.
-2. **AI Regeneration (~$0.13/page with Nano Banana Pro):** an image model redraws the whole
+2. **AI Regeneration (~$0.03/page with the default Nano Banana 2.1, ~$0.13 with Nano Banana Pro):**
+   an image model redraws the whole
    page without the answers. It can look cleaner on heavily marked pages, but it may alter
    printed text (articles, umlauts, `ß`), so check the output.
 3. **Local OpenCV Filter (free, offline):** removes blue or colored ink by color thresholds

@@ -12,10 +12,10 @@ import os
 import cv2
 import numpy as np
 import handwriting_eraser
-from cleaner import WorksheetCleaner
+from cleaner import DEFAULT_REGEN_MODEL, WorksheetCleaner
 
 ENGINE_DETECT = "🔍 Detect & Erase (cheap, keeps printed text exact)"
-ENGINE_REGENERATE = "🍌 AI Regeneration (Nano Banana Pro, redraws page)"
+ENGINE_REGENERATE = "🍌 AI Regeneration (Nano Banana 2.1, redraws page)"
 ENGINE_OPENCV = "🎨 Local OpenCV Filter (Offline)"
 
 # Setup page configuration for mobile-friendly view
@@ -97,7 +97,7 @@ def main():
         help=(
             "Detect & Erase: a cheap vision model (~$0.002/page) only finds the handwriting; "
             "it is erased locally, so printed text is never changed. "
-            "AI Regeneration: an image model redraws the whole page (~$0.13/page) and may alter printed text."
+            "AI Regeneration: an image model redraws the whole page (~$0.03/page with Nano Banana 2.1) and may alter printed text."
         ),
     )
     needs_api_key = cleaning_engine in (ENGINE_DETECT, ENGINE_REGENERATE)
@@ -147,8 +147,8 @@ def main():
         api_key = api_key_input(handwriting_eraser.PROVIDER_OPENROUTER)
         provider_name = "OpenRouter"
         model_options = {
-            "🍌 Nano Banana Pro (google/gemini-3-pro-image) [Recommended]": "google/gemini-3-pro-image",
-            "⚡ Nano Banana 2.1 (google/gemini-nano-banana-2.1) [Fast & Cheap]": "google/gemini-nano-banana-2.1",
+            "⚡ Nano Banana 2.1 (google/gemini-nano-banana-2.1) [Recommended, ~4x cheaper]": "google/gemini-nano-banana-2.1",
+            "🍌 Nano Banana Pro (google/gemini-3-pro-image) [Highest quality, ~$0.13/page]": "google/gemini-3-pro-image",
             "⚡ Gemini 3.1 Flash Image (google/gemini-3.1-flash-image)": "google/gemini-3.1-flash-image",
             "⚡ Gemini 2.5 Flash Image (google/gemini-2.5-flash-image)": "google/gemini-2.5-flash-image",
             "✨ OpenAI GPT-5 Image (openai/gpt-5-image)": "openai/gpt-5-image",
@@ -165,11 +165,11 @@ def main():
             "AI Model",
             options=list(model_options.keys()),
             index=0,
-            help="Select the AI model. For worksheets, use Image-to-Image models (Nano Banana Pro / Gemini / GPT-5 Image)."
+            help="Select the AI model. For worksheets, use Image-to-Image models (Nano Banana 2.1 / Pro / Gemini / GPT-5 Image)."
         )
 
         if model_options[selected_label] == "custom":
-            chosen_model = st.sidebar.text_input("Enter OpenRouter Model Slug", value="google/gemini-3-pro-image")
+            chosen_model = st.sidebar.text_input("Enter OpenRouter Model Slug", value=DEFAULT_REGEN_MODEL)
         else:
             chosen_model = model_options[selected_label]
 
@@ -177,8 +177,8 @@ def main():
             st.markdown(
                 """
                 **🍌 Google Image Models (Native Image-to-Image):**
+                - `google/gemini-nano-banana-2.1` (Nano Banana 2.1 — default, fast & ~4x cheaper than Pro)
                 - `google/gemini-3-pro-image` (Nano Banana Pro — Highest quality text & question preservation)
-                - `google/gemini-nano-banana-2.1` (Ultra fast & cheap)
                 - `google/gemini-3.1-flash-image` (Flash image generation)
                 - `google/gemini-2.5-flash-image` (Standard Flash image)
 
