@@ -343,11 +343,20 @@ class _Sanitizer(HTMLParser):
             if top == tag:
                 return
 
+    def _open_in_table(self, tag: str) -> bool:
+        """Is `tag` open in the innermost table (not in a table around it)?"""
+        for open_tag in reversed(self._open):
+            if open_tag == tag:
+                return True
+            if open_tag == "table":
+                return False
+        return False
+
     def _close_implicitly(self, tag: str) -> None:
         """Closes elements that the new start tag ends, as browsers do."""
         if tag in ("td", "th") and self._open and self._open[-1] in ("td", "th"):
             self._close_until(self._open[-1])
-        elif tag == "tr" and "tr" in self._open:
+        elif tag == "tr" and self._open_in_table("tr"):
             self._close_until("tr")
         elif tag == "li" and self._open and self._open[-1] == "li":
             self._close_until("li")

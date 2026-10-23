@@ -527,3 +527,18 @@ def test_api_key_is_redacted_from_network_errors():
         with pytest.raises(gemini_client.GeminiError) as info:
             gemini_client.call_gemini([], "AIzaSecret123", "m")
     assert "AIzaSecret123" not in str(info.value) and "***" in str(info.value)
+
+
+def test_nested_table_rows_stay_inside_their_own_table():
+    html, _ = rt.sanitize_html(
+        "<table><tr><td>a<table><tr><td>x</td></tr><tr><td>y</td></tr></table></td>"
+        "<td>b</td></tr><tr><td>c</td></tr></table>"
+    )
+    assert html == (
+        "<table><tr><td>a<table><tr><td>x</td></tr><tr><td>y</td></tr></table></td>"
+        "<td>b</td></tr><tr><td>c</td></tr></table>"
+    )
+    # a new row still ends the open row of the same table
+    assert rt.sanitize_html("<table><tr><td>a<tr><td>b</table>")[0] == (
+        "<table><tr><td>a</td></tr><tr><td>b</td></tr></table>"
+    )
