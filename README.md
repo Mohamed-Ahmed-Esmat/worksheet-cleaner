@@ -24,8 +24,14 @@ The app has four cleaning engines (pick one in the sidebar):
      a printed word hidden under a student's circle, so check flagged lines before printing.
    - The model's HTML is sanitized (simple formatting tags only, no links, scripts or remote
      resources) before rendering.
-   - Not kept: the original fonts, exact positions and watermark. Pictures are shown as
-     "[picture]" for now; use Detect & Erase for pages that need them.
+   - Pictures, drawings and diagrams are cropped from the photo (the model only gives their
+     position), their background is whitened, and they are placed in the page, also inside
+     table cells. If the student marked a picture, or the model cannot tell, the app says so,
+     because those marks are copied too. A picture the model cannot locate is shown as
+     "[picture]". At most 12 pictures per page are copied.
+   - A worksheet that does not quite fit on one A4 sheet (often just its page number) is set
+     again with tighter spacing, so it does not waste a second sheet.
+   - Not kept: the original fonts, exact positions and watermark.
 2. **Detect & Erase (free on the Gemini API free tier):** a cheap vision model
    (`gemini-3.5-flash-lite`, called on the Gemini API directly, or via OpenRouter for
    ~$0.002/page) only *finds* the handwriting and

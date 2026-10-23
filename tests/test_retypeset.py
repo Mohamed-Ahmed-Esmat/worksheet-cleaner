@@ -2,8 +2,11 @@
 
 import json
 import os
+import re
 from unittest import mock
 
+import cv2
+import numpy as np
 import pypdfium2 as pdfium
 import pytest
 import requests
@@ -295,8 +298,8 @@ def test_sanitize_replaces_pictures_and_records_their_boxes():
     html, figures = rt.sanitize_html(
         '<img src="https://x.example/a.png" data-box="10, 20,300,400"><img data-box="bad">'
     )
-    assert html.count("[picture]") == 2 and "src" not in html
-    assert figures == ["10,20,300,400", ""]
+    assert html.count("[picture]") == 2 and "src" not in html and "example" not in html
+    assert figures == [rt.Figure((10, 20, 300, 400)), rt.Figure(None)]
 
 
 def test_sanitize_escapes_text_and_widens_blanks():
@@ -377,7 +380,7 @@ def test_sanitize_closes_open_tags_and_ignores_stray_end_tags():
 
 def test_self_closing_dropped_tags_do_not_hide_the_rest_of_the_page():
     html, figures = rt.sanitize_html("<p>vor</p><script/><svg/><iframe/><p>nach</p>")
-    assert "nach" in html and html.count("[picture]") == 1 and figures == [""]
+    assert "nach" in html and html.count("[picture]") == 1 and figures == [rt.Figure(None)]
     html, _ = rt.sanitize_html("<p>a</p><svg><text>Logo</text></svg><p>b</p>")
     assert "Logo" not in html and "<p>b</p>" in html
 
@@ -527,6 +530,306 @@ def test_api_key_is_redacted_from_network_errors():
         with pytest.raises(gemini_client.GeminiError) as info:
             gemini_client.call_gemini([], "AIzaSecret123", "m")
     assert "AIzaSecret123" not in str(info.value) and "***" in str(info.value)
+
+
+# ---------------------------------------------------------------------------
+# Pictures
+# ---------------------------------------------------------------------------
+def photo(boxes_dark=((200, 100, 500, 450),), size=(1300, 1000)) -> bytes:
+    """A grey 'photographed' page with dark filled pictures at (y1, x1, y2, x2) pixels."""
+    page = np.full((*size, 3), (190, 195, 200), np.uint8)
+    for y1, x1, y2, x2 in boxes_dark:
+        cv2.rectangle(page, (x1, y1), (x2, y2), (40, 40, 40), -1)
+    return cv2.imencode(".jpg", page)[1].tobytes()
+
+
+def test_parse_box_accepts_only_sane_boxes():
+    assert rt.parse_box(" 10, 20 ,300,400 ") == (10, 20, 300, 400)
+    for bad in ("", "1,2,3", "5,5,4,9", "1,2,3,4000", "a,b,c,d", "0,0,1000,1000", "-1,0,5,5"):
+        assert rt.parse_box(bad) is None, bad
+
+
+def test_sanitizer_records_pictures_and_handwriting_flag_without_copying_attributes():
+    html, figures = rt.sanitize_html(
+        '<p>Bild: <img data-box="1,2,300,400" data-handwriting="Yes" src="http://x.example/a.png">'
+        '<img data-box="5,5,50,50" data-handwriting="no" data-fig="7" onerror="x()">'
+        '<p data-fig="3" class="figure">[picture]</p>'
+    )
+    assert figures == [rt.Figure((1, 2, 300, 400), True), rt.Figure((5, 5, 50, 50), False)]
+    # numbered placeholders come only from the sanitizer, the model's look-alike stays inert
+    assert html.count('data-fig="0"') == 1 and html.count('data-fig="1"') == 1
+    assert 'data-fig="3"' not in html and 'data-fig="7"' not in html
+    assert "<p>Bild: </p><p class=\"figure\" data-fig=\"0\">" in html  # open <p> closed first
+    assert "http" not in html and "onerror" not in html
+
+
+def test_crop_picture_adds_margin_clamps_to_the_page_and_rejects_tiny_boxes():
+    page = np.zeros((1000, 2000, 3), np.uint8)
+    crop = rt.crop_picture(page, (100, 100, 300, 400))
+    assert crop.shape[:2] == (212, 636)  # 200x600 px plus a 3% margin on each side
+    assert rt.crop_picture(page, (900, 900, 1000, 1000)).shape[:2] == (103, 206)  # clamped
+    assert rt.crop_picture(page, (0, 0, 10, 5)) is None
+
+
+def test_whiten_background_turns_paper_white_and_keeps_dark_content():
+    crop = np.full((100, 100, 3), (190, 195, 200), np.uint8)
+    crop[30:70, 30:70] = (40, 40, 40)
+    out = rt.whiten_background(crop)
+    assert (out[0, 0] == 255).all() and (out[50, 50] < 80).all()
+
+
+def test_embed_figures_replaces_usable_placeholders_with_data_images():
+    html, figures = rt.sanitize_html(
+        '<p>a</p><img data-box="154,100,385,450"><img data-box="bad"><p>b</p>'
+    )
+    out = rt.embed_figures(html, figures, photo())
+    assert [f.embedded for f in figures] == [True, False]
+    assert out.count('<img src="data:image/jpeg;base64,') == 1
+    assert out.count("[picture]") == 1 and "<p>a</p>" in out and "<p>b</p>" in out
+    assert re.search(r'style="width: \d+\.\dcm"', out)
+    assert out.index("data:image") < out.index("[picture]")  # the good box got the picture
+
+
+def test_embed_figures_leaves_html_alone_when_the_photo_cannot_be_decoded():
+    html, figures = rt.sanitize_html('<img data-box="154,100,385,450">')
+    assert rt.embed_figures(html, figures, b"not a jpeg") == html
+    assert not figures[0].embedded
+
+
+def test_picture_width_follows_the_photo_and_keeps_tall_pictures_on_the_page():
+    wide = rt.picture_tag(np.zeros((100, 400, 3), np.uint8), (0, 0, 100, 800))
+    assert 'width: 15.0cm' in wide  # 80% of the photo width x 17 cm x 1.1
+    tall = rt.picture_tag(np.zeros((900, 100, 3), np.uint8), (0, 0, 900, 500))
+    assert 'width: 2.0cm' in tall  # 18 cm high at most
+
+
+def test_transcribe_embeds_pictures_after_the_text_cross_check(fake):
+    page_html = '<p>Was ist das?</p><img data-box="154,100,385,450" data-handwriting="yes">'
+    other_html = '<p>Was ist das?</p>'  # the second reader may not report the picture at all
+    fake(**{ROBOTICS: ok(reply(page_html)), FLASH: ok(reply(other_html))})
+    result = rt.transcribe_page(photo(), "k")
+    assert result.flagged == []  # pictures are cropped, not read: no false disagreement
+    assert result.figures == [rt.Figure((154, 100, 385, 450), True, True)]
+    assert "data:image/jpeg;base64," in result.html and "[picture]" not in result.html
+
+
+def test_rendered_pdf_contains_the_picture_and_still_blocks_other_sources():
+    from pypdfium2 import raw as pdfium_c
+
+    html, figures = rt.sanitize_html('<p>x</p><img data-box="154,100,385,450">')
+    page_html = rt.embed_figures(html, figures, photo())
+    remote = '<img src="http://example.com/a.png">'
+    with mock.patch("socket.create_connection") as connect, \
+            mock.patch("socket.getaddrinfo") as resolve:
+        pdf = rt.render_pdf([page_html + remote])
+    assert not connect.called and not resolve.called
+    doc = pdfium.PdfDocument(pdf)
+    try:
+        images = [o for o in doc[0].get_objects() if o.type == pdfium_c.FPDF_PAGEOBJ_IMAGE]
+    finally:
+        doc.close()
+    assert len(images) == 1
+
+
+
+def image_sizes_cm(pdf: bytes) -> list:
+    from pypdfium2 import raw as pdfium_c
+
+    doc = pdfium.PdfDocument(pdf)
+    try:
+        sizes = []
+        for i in range(len(doc)):
+            for o in doc[i].get_objects():
+                if o.type == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                    left, bottom, right, top = o.get_pos()
+                    sizes.append(((right - left) / 72 * 2.54, (top - bottom) / 72 * 2.54))
+        return sizes
+    finally:
+        doc.close()
+
+
+def test_picture_in_a_table_cell_keeps_its_size():
+    html, figures = rt.sanitize_html(
+        '<table><tr><td>Was ist das?</td><td><img data-box="154,100,385,450"></td></tr></table>'
+    )
+    assert '<td class="pic" data-cell="0">' in html and figures[0].cell == 0
+    out = rt.embed_figures(html, figures, photo())
+    assert re.search(r'<td class="pic" style="height: \d+\.\dcm">', out) and "data-cell" not in out
+    [(width, height)] = image_sizes_cm(rt.render_pdf([out]))
+    assert width > 4 and height > 3  # not squeezed into the 34 pt row
+
+
+def test_two_pictures_in_one_cell_share_it_and_both_fit():
+    html, figures = rt.sanitize_html(
+        '<table><tr><td><img data-box="0,0,150,200"><img data-box="200,0,350,200"></td>'
+        '<td><img data-box="400,0,550,200"></td></tr></table>'
+    )
+    assert [f.cell for f in figures] == [0, 0, 1] and html.count("data-cell") == 2
+    sizes = image_sizes_cm(rt.render_pdf([rt.embed_figures(html, figures, photo())]))
+    assert len(sizes) == 3 and all(w > 3 for w, _ in sizes)
+
+
+def test_picture_cell_that_is_not_last_in_its_row_keeps_its_size():
+    # xhtml2pdf takes the row height from the last cell, so every cell of the row is sized.
+    html, figures = rt.sanitize_html(
+        '<table><tr><td><img data-box="154,100,385,450"></td><td>Was ist das?</td></tr>'
+        '<tr><td>a</td><td>b</td></tr></table>'
+    )
+    out = rt.embed_figures(html, figures, photo())
+    first_row, second_row = out.split("</tr>")[:2]
+    assert first_row.count('style="height:') == 2 and "style" not in second_row
+    [(width, height)] = image_sizes_cm(rt.render_pdf([out]))
+    assert width > 4 and height > 3
+
+
+def test_nested_table_in_a_picture_row_is_left_alone():
+    html, figures = rt.sanitize_html(
+        '<table><tr><td><img data-box="154,100,385,450"></td>'
+        '<td><table><tr><td>x</td></tr></table></td></tr></table>'
+    )
+    out = rt.embed_figures(html, figures, photo())
+    assert out.count('style="height:') == 2  # the two outer cells, not the nested one
+    assert "<table><tr><td>x</td></tr></table>" in out
+
+
+def test_picture_cell_without_a_row_gets_its_own_height():
+    html, figures = rt.sanitize_html('<table><td><img data-box="154,100,385,450"></td></table>')
+    assert figures[0].cell == 0 and figures[0].row is None
+    out = rt.embed_figures(html, figures, photo())
+    assert re.search(r'<td class="pic" style="height: \d+\.\dcm">', out)
+
+
+def test_cell_marks_are_removed_when_no_picture_is_embedded():
+    html, figures = rt.sanitize_html('<table><tr><td><img data-box="bad"></td></tr></table>')
+    assert "data-cell" not in rt.embed_figures(html, figures, photo())
+    assert "data-cell" not in rt.embed_figures(html, figures, b"not a jpeg")
+
+
+def test_model_cannot_set_a_cell_mark():
+    html, _ = rt.sanitize_html('<table><tr><td data-cell="0" style="height: 99cm">a</td></tr></table>')
+    assert html == "<table><tr><td>a</td></tr></table>"
+
+
+def test_model_cannot_set_the_picture_cell_class_itself():
+    html, _ = rt.sanitize_html('<table><tr><td class="pic">a</td></tr></table>')
+    assert html == "<table><tr><td>a</td></tr></table>"
+
+
+def test_inline_picture_reopens_the_paragraph_and_its_formatting():
+    html, _ = rt.sanitize_html('<p><b>Bild: <img data-box="1,2,300,400"> Ende</b> gut</p>')
+    assert html == (
+        '<p><b>Bild: </b></p><p class="figure" data-fig="0">[picture]</p><p><b> Ende</b> gut</p>'
+    )
+    assert rt.text_lines(html) == ["Bild:", "[picture]", "Ende gut"]
+
+
+def test_text_outside_paragraphs_is_not_glued_to_the_next_line():
+    assert rt.text_lines("<p>a</p>bare text<p>c</p>") == ["a", "bare text", "c"]
+
+
+def test_picture_wrappers_produce_a_single_figure():
+    html, figures = rt.sanitize_html('<picture><img data-box="1,2,300,400"></picture><canvas></canvas>')
+    assert figures == [rt.Figure((1, 2, 300, 400))] and html.count("[picture]") == 1
+
+
+@pytest.mark.parametrize("flag, expected", [
+    ("yes", True), (" Ja ", True), ("TRUE", True), ("no", False), ("NEIN", False), ("0", False),
+    (None, None), ("", None), ("yes|no", None), ("maybe", None),
+])
+def test_handwriting_flag_is_only_clean_when_the_model_says_so(flag, expected):
+    attr = "" if flag is None else f' data-handwriting="{flag}"'
+    _, [figure] = rt.sanitize_html(f'<img data-box="1,2,300,400"{attr}>')
+    assert figure.has_handwriting is expected
+
+
+def test_whitening_uses_the_page_paper_when_the_box_cut_into_the_picture():
+    rng = np.random.default_rng(0)
+    crop = rng.integers(30, 110, (120, 160, 3)).astype(np.uint8)  # all picture, no paper border
+    page_paper = np.array([190.0, 195.0, 200.0])
+    kept = rt.whiten_background(crop, page_paper)
+    washed = rt.whiten_background(crop)
+    assert kept.mean() < 120 < washed.mean()
+
+
+def test_whitening_follows_local_paper_when_the_border_is_paper():
+    crop = np.full((100, 100, 3), (150, 155, 160), np.uint8)  # paper in a shadow
+    crop[30:70, 30:70] = (40, 40, 40)
+    out = rt.whiten_background(crop, np.array([190.0, 195.0, 200.0]))
+    assert (out[0, 0] == 255).all() and (out[50, 50] < 80).all()
+
+
+def test_picture_count_is_capped_and_reported(fake):
+    boxes = "".join(f'<img data-box="{10 + 60 * i},10,{60 + 60 * i},60">' for i in range(14))
+    fake(**{ROBOTICS: ok(reply("<p>x</p>" + boxes))})
+    result = rt.transcribe_page(photo(), "k", verify=False)
+    assert sum(f.embedded for f in result.figures) == rt.MAX_PICTURES_PER_PAGE
+    assert result.html.count("[picture]") == 2
+    assert any("only the first 12" in n for n in result.notes)
+
+
+def test_total_picture_area_is_capped():
+    html, figures = rt.sanitize_html(
+        '<img data-box="0,0,800,800"><img data-box="100,100,900,900"><img data-box="5,5,50,50">'
+    )
+    rt.embed_figures(html, figures, photo())
+    assert [f.embedded for f in figures] == [True, False, True]  # 64% + 64% > 100% of the photo
+
+
+def test_crops_are_scaled_down_to_print_resolution():
+    tag = rt.picture_tag(np.zeros((1500, 3000, 3), np.uint8), (0, 0, 500, 1000))
+    data = re.search(r"base64,([^\"]+)", tag).group(1)
+    import base64
+
+    img = cv2.imdecode(np.frombuffer(base64.b64decode(data), np.uint8), cv2.IMREAD_COLOR)
+    assert img.shape[1] == int(17.0 / 2.54 * 200)  # 17 cm at 200 dpi, not 3000 px
+
+
+def test_two_pictures_each_get_their_own_width():
+    html, figures = rt.sanitize_html('<img data-box="0,0,200,300"><img data-box="300,0,500,700">')
+    out = rt.embed_figures(html, figures, photo())
+    widths = [float(w) for w in re.findall(r"width: (\d+\.\d)cm", out)]
+    assert widths == [5.6, 13.1]  # 30% and 70% of the photo width x 17 cm x 1.1, in order
+
+
+def test_bad_box_before_good_box_keeps_the_order():
+    html, figures = rt.sanitize_html('<img data-box="bad"><img data-box="154,100,385,450">')
+    out = rt.embed_figures(html, figures, photo())
+    assert out.index("[picture]") < out.index("data:image")
+
+
+def test_pictures_are_embedded_without_the_cross_check(fake):
+    f = fake(**{ROBOTICS: ok(reply('<p>x</p><img data-box="154,100,385,450">'))})
+    result = rt.transcribe_page(photo(), "k", verify=False)
+    assert f.models_called == [ROBOTICS]
+    assert result.figures[0].embedded and "data:image/jpeg" in result.html
+
+
+def test_merge_pdfs_joins_pages_in_order():
+    merged = rt.merge_pdfs([rt.render_pdf(["<p>Seite eins</p>"]), rt.render_pdf(["<p>Seite zwei</p>"])])
+    doc = pdfium.PdfDocument(merged)
+    try:
+        texts = [doc[i].get_textpage().get_text_bounded() for i in range(len(doc))]
+    finally:
+        doc.close()
+    assert len(texts) == 2 and "eins" in texts[0] and "zwei" in texts[1]
+
+
+def test_empty_wrappers_around_a_picture_are_removed():
+    html, _ = rt.sanitize_html('<p>a</p><p><img data-box="1,2,300,400"></p><p><b> </b></p><p>b</p>')
+    assert html == '<p>a</p><p class="figure" data-fig="0">[picture]</p><p>b</p>'
+
+
+def test_page_that_spills_over_is_rendered_compact_on_one_sheet():
+    long_page = "".join(f"<p>{i}-Das ist ........ Wort {i} .</p>" for i in range(30))
+    assert rt.page_count(rt.render_pdf([long_page])) == 2
+    assert rt.page_count(rt.render_page(long_page + '<p class="num">5</p>')) == 1
+
+
+def test_page_that_fits_keeps_the_normal_spacing():
+    short_page = "<h1>Grammatik</h1><p>1-Das ist ........ Gitarre .</p>"
+    with mock.patch.object(rt, "render_pdf", wraps=rt.render_pdf) as render:
+        assert rt.page_count(rt.render_page(short_page)) == 1
+    assert [c.kwargs.get("compact", False) for c in render.call_args_list] == [False]
 
 
 def test_nested_table_rows_stay_inside_their_own_table():

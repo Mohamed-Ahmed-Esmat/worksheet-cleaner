@@ -7,6 +7,10 @@ rendered as a crisp A4 PDF. Handwriting, pen circles, shadows and watermarks
 simply never make it into the output, and no printed letter is redrawn as
 pixels.
 
+Pictures, drawings and diagrams are cropped from the photo (the model only
+gives their position), cleaned to a white background and embedded in the page.
+The model never controls a URL: every image is a data: URI built here.
+
 The risk is the opposite one: a reader can silently misread a printed word
 (typically one hidden under a student's circle). So each page is, by default,
 read a second time by a different model and every line where the two readers
@@ -16,6 +20,7 @@ Models are tried in order (RETYPE_CHAIN); a model that is out of quota,
 overloaded or retired is skipped and the next one is used.
 """
 
+import base64
 import html as html_lib
 import io
 import json
@@ -25,6 +30,9 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
+
+import cv2
+import numpy as np
 
 from gemini_client import GeminiError, call_gemini, image_part
 
@@ -56,7 +64,10 @@ bold/underlined, one <p> per numbered line, and <table> for tables. Keep every r
 every column of a table, including empty rows and empty columns. Use <p class="num"> for \
 the page number. Use only these tags: h1 h2 h3 p b u i br div table tr td th ul ol li.
 5. If the worksheet contains a picture, drawing or diagram, output \
-<img data-box="ymin,xmin,ymax,xmax"> where the box is normalized to 0-1000 on this photo.
+<img data-box="ymin,xmin,ymax,xmax" data-handwriting="yes|no"> at its place. The box \
+tightly encloses only the picture (not the text around it) and is normalized to 0-1000 \
+on this photo. data-handwriting is "yes" if the student wrote, drew or marked anything \
+on or inside the picture.
 
 First list every piece of handwriting you see (pen/pencil answers, words written on \
 dotted lines or in table cells, circles, crossings-out), quoting the handwritten words and \
@@ -74,12 +85,46 @@ h3 { font-size: 15pt; margin: 10pt 0 6pt 0; }
 p { margin: 0 0 8pt 0; }
 p.num { text-align: center; margin-top: 24pt; }
 p.figure { color: #777; font-style: italic; }
+p.picture { text-align: center; margin: 6pt 0 10pt 0; }
 table { width: 100%; margin: 6pt 0 10pt 0; }
 td, th { border: 1px solid #000; padding: 4pt 6pt; height: 34pt; font-size: 13pt;
          line-height: 1.2; vertical-align: middle; }
+td.pic, th.pic { text-align: center; }
 """
 
+# Tighter spacing for a worksheet that does not quite fit on one A4 page. It
+# replaces the @page rule (xhtml2pdf rejects a second one) and overrides the rest.
+_PAGE_RULE = "@page { size: a4 portrait; margin: 1.8cm 2cm; }"
+_COMPACT_PAGE_RULE = "@page { size: a4 portrait; margin: 1.2cm 1.6cm; }"
+COMPACT_CSS = """
+body { font-size: 12.5pt; line-height: 1.3; }
+h1 { font-size: 21pt; margin: 0 0 4pt 0; }
+h2 { font-size: 16pt; margin: 6pt 0 4pt 0; }
+h3 { font-size: 14pt; margin: 6pt 0 4pt 0; }
+p { margin: 0 0 5pt 0; }
+p.num { margin-top: 10pt; }
+td, th { height: 28pt; font-size: 12pt; }
+"""
+_EMPTY_INLINE = re.compile(r"<(p|b|strong|u|i|em|div)>\s*</\1>")
+
 MIN_BLANK_DOTS = 14  # models tend to shorten answer blanks; give students room to write
+
+# Pictures
+CONTENT_WIDTH_CM = 17.0      # A4 minus the left/right page margins
+MAX_PICTURE_HEIGHT_CM = 18.0
+_PICTURE_MARGIN = 0.03       # crop this much (of the box size) around the model's box
+_MIN_PICTURE_PX = 24         # smaller crops are noise
+_MAX_PICTURE_AREA = 0.85     # a "picture" covering most of the photo is a misread page
+MAX_PICTURES_PER_PAGE = 12   # more is a misread page (or an attempt to bloat the PDF)
+_MAX_TOTAL_PICTURE_AREA = 1.0  # all pictures together may not cover more than the photo
+_PICTURE_DPI = 200           # crops are scaled down to this print resolution
+_PICTURE_SPACING_CM = 0.9    # margins + line spacing around one picture block in a cell
+_PLACEHOLDER = re.compile(r'<p class="figure" data-fig="(\d+)">\[picture\]</p>')
+_CELL_MARK = re.compile(r' data-cell="(\d+)"')
+_ROW_MARK = re.compile(r' data-row="(\d+)"')
+_ROW_TAGS = re.compile(r"<(/?)(tr|td|th)\b([^>]*)>")
+_PAPER_MIN_BRIGHTNESS = 0.65  # a crop border this bright (vs. the page paper) can be paper...
+_PAPER_MAX_TINT = 1.15        # ...if it is no more tinted than this (channel ratio spread)
 
 
 class RetypeError(RuntimeError):
@@ -99,13 +144,24 @@ class LineDiff:
 
 
 @dataclass
+class Figure:
+    """A picture on the worksheet, located by the model."""
+
+    box: Optional[Tuple[int, int, int, int]]  # ymin, xmin, ymax, xmax on 0-1000; None if unusable
+    has_handwriting: Optional[bool] = None    # student marks on it? None = the model did not say
+    embedded: bool = False                    # copied into the page (else a placeholder is shown)
+    cell: Optional[int] = None                # table cell holding it (its height must fit it)
+    row: Optional[int] = None                 # table row holding that cell
+
+
+@dataclass
 class RetypeResult:
     html: str                       # sanitized body HTML of the blank worksheet
     model: str                      # model whose reading is used
     verify_model: Optional[str] = None
     flagged: List[LineDiff] = field(default_factory=list)
     handwriting: list = field(default_factory=list)   # what the model said it left out
-    figures: List[str] = field(default_factory=list)  # data-box values of pictures (not rendered yet)
+    figures: List[Figure] = field(default_factory=list)  # pictures, in page order
     notes: List[str] = field(default_factory=list)    # fallbacks and skipped checks, for the user
     exhausted: Set[str] = field(default_factory=set)  # models that hit their quota (skip them next)
 
@@ -160,9 +216,9 @@ def _next(i: int, models: Sequence[str]) -> str:
 
 def _read_page(
     jpeg_bytes: bytes, api_key: str, models: Sequence[str], notes: List[str], exhausted: Set[str]
-) -> Tuple[str, str, List[str], list, List[str]]:
+) -> Tuple[str, str, List[Figure], list, List[str]]:
     """
-    Tries the models in order. Returns (model, sanitized html, picture boxes,
+    Tries the models in order. Returns (model, sanitized html, pictures,
     handwriting, models after it). Raises RetypeError if every model fails.
     """
     first_note = len(notes)
@@ -220,25 +276,203 @@ def transcribe_page(
         html=html, model=model, handwriting=handwriting, figures=figures, notes=notes,
         exhausted=exhausted,
     )
-    if not verify:
-        return result
-    if not rest:
-        notes.append("No second model was available, so the text was not double-checked.")
-        return result
-    try:
-        verify_model, other_html, _, _, _ = _read_page(jpeg_bytes, api_key, rest, notes, exhausted)
-    except RetypeError:
-        notes.append("No second model could read the page, so the text was not double-checked.")
-        return result
-    result.verify_model = verify_model
-    result.flagged = compare_readings(html, other_html)
+    if verify:
+        _cross_check(result, jpeg_bytes, api_key, rest)
+    # Pictures go in last: the cross-check compares text only.
+    result.html = embed_figures(result.html, result.figures, jpeg_bytes)
+    boxed = sum(1 for f in result.figures if f.box)
+    if boxed > MAX_PICTURES_PER_PAGE:
+        result.notes.append(
+            f"The page has {boxed} pictures; only the first {MAX_PICTURES_PER_PAGE} were copied."
+        )
     return result
+
+
+def _cross_check(result: RetypeResult, jpeg_bytes: bytes, api_key: str, rest: List[str]) -> None:
+    if not rest:
+        result.notes.append("No second model was available, so the text was not double-checked.")
+        return
+    try:
+        verify_model, other_html, _, _, _ = _read_page(
+            jpeg_bytes, api_key, rest, result.notes, result.exhausted
+        )
+    except RetypeError:
+        result.notes.append(
+            "No second model could read the page, so the text was not double-checked."
+        )
+        return
+    result.verify_model = verify_model
+    result.flagged = compare_readings(result.html, other_html)
+
+
+# ---------------------------------------------------------------------------
+# Pictures
+# ---------------------------------------------------------------------------
+def parse_box(value: str) -> Optional[Tuple[int, int, int, int]]:
+    """A "ymin,xmin,ymax,xmax" box on 0-1000, or None if it is not a usable box."""
+    m = re.fullmatch(r"\s*(\d{1,4})" + r"\s*,\s*(\d{1,4})" * 3 + r"\s*", value or "")
+    if not m:
+        return None
+    ymin, xmin, ymax, xmax = (int(v) for v in m.groups())
+    if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
+        return None
+    if (ymax - ymin) * (xmax - xmin) > _MAX_PICTURE_AREA * 1_000_000:
+        return None
+    return ymin, xmin, ymax, xmax
+
+
+def crop_picture(page: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    """Cuts the boxed picture (plus a small margin) out of the page photo."""
+    h, w = page.shape[:2]
+    ymin, xmin, ymax, xmax = box
+    y1, y2 = ymin * h / 1000, ymax * h / 1000
+    x1, x2 = xmin * w / 1000, xmax * w / 1000
+    my, mx = (y2 - y1) * _PICTURE_MARGIN, (x2 - x1) * _PICTURE_MARGIN
+    y1, y2 = max(0, int(y1 - my)), min(h, int(round(y2 + my)))
+    x1, x2 = max(0, int(x1 - mx)), min(w, int(round(x2 + mx)))
+    if y2 - y1 < _MIN_PICTURE_PX or x2 - x1 < _MIN_PICTURE_PX:
+        return None
+    return page[y1:y2, x1:x2].copy()
+
+
+def page_paper_colour(page: np.ndarray) -> np.ndarray:
+    """The page's paper colour: the bright end of a downscaled copy of the photo."""
+    small = cv2.resize(page, None, fx=0.125, fy=0.125, interpolation=cv2.INTER_AREA)
+    return np.percentile(small.reshape(-1, 3).astype(np.float32), 90, axis=0)
+
+
+def whiten_background(crop: np.ndarray, page_paper: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Scales the colours so the paper around the picture becomes white. The crop's
+    border is the reference when it looks like paper (nearly as bright as the
+    page's paper and not tinted), which follows local lighting such as a shadow.
+    When the model's box cut into the picture, the border is the picture itself
+    (darker, or coloured like a sky), so the page's paper colour is used instead
+    and the picture is not washed out.
+    """
+    border = np.concatenate([crop[0], crop[-1], crop[:, 0], crop[:, -1]]).astype(np.float32)
+    paper = np.percentile(border, 90, axis=0)
+    if page_paper is not None:
+        ratios = paper / np.maximum(np.asarray(page_paper, dtype=np.float32), 1.0)
+        looks_like_paper = (ratios.min() >= _PAPER_MIN_BRIGHTNESS
+                            and ratios.max() / max(ratios.min(), 1e-6) <= _PAPER_MAX_TINT)
+        if not looks_like_paper:
+            paper = np.asarray(page_paper, dtype=np.float32)
+    paper = np.maximum(paper, 40.0)  # never blow up colours from a dark reference
+    out = crop.astype(np.float32) * (255.0 / paper)
+    out[out.min(axis=2) > 235] = 255  # near-white paper -> pure white for printing
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def picture_size_cm(shape: Tuple[int, ...], box: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    """Printed (width, height): the picture's share of the photo width, kept on the page."""
+    h, w = shape[:2]
+    width = min(CONTENT_WIDTH_CM, max(3.0, (box[3] - box[1]) / 1000 * CONTENT_WIDTH_CM * 1.1))
+    width = round(min(width, MAX_PICTURE_HEIGHT_CM * w / h), 1)
+    return width, width * h / w
+
+
+def picture_tag(crop: np.ndarray, box: Tuple[int, int, int, int]) -> str:
+    """An <img> with a data: URI, sized like the picture's share of the photo width."""
+    h, w = crop.shape[:2]
+    width, _ = picture_size_cm(crop.shape, box)
+    print_px = int(width / 2.54 * _PICTURE_DPI)
+    if w > print_px:  # no need to embed more pixels than the printer can use
+        crop = cv2.resize(crop, (print_px, max(1, round(h * print_px / w))),
+                          interpolation=cv2.INTER_AREA)
+    ok, jpeg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise ValueError("could not encode the picture")
+    uri = "data:image/jpeg;base64," + base64.b64encode(jpeg.tobytes()).decode()
+    return f'<p class="picture"><img src="{uri}" style="width: {width:.1f}cm"></p>'
+
+
+def embed_figures(html: str, figures: List[Figure], jpeg_bytes: bytes) -> str:
+    """
+    Replaces each picture placeholder whose box is usable with the cropped
+    picture, up to MAX_PICTURES_PER_PAGE pictures covering at most the photo's
+    area in total (the model's reply is untrusted and must not bloat the PDF).
+    """
+    page = None
+    if any(f.box for f in figures):
+        page = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if page is None:
+        return _ROW_MARK.sub("", _CELL_MARK.sub("", html))
+    page_paper = page_paper_colour(page)
+    budget = {"count": MAX_PICTURES_PER_PAGE, "area": _MAX_TOTAL_PICTURE_AREA * 1_000_000}
+    cell_heights: dict = {}
+
+    def replace(match: re.Match) -> str:
+        index = int(match.group(1))
+        figure = figures[index] if index < len(figures) else None
+        if figure is None or figure.box is None:
+            return match.group(0)
+        ymin, xmin, ymax, xmax = figure.box
+        area = (ymax - ymin) * (xmax - xmin)
+        if budget["count"] <= 0 or area > budget["area"]:
+            return match.group(0)
+        crop = crop_picture(page, figure.box)
+        if crop is None:
+            return match.group(0)
+        try:
+            tag = picture_tag(whiten_background(crop, page_paper), figure.box)
+        except ValueError:
+            return match.group(0)
+        budget["count"] -= 1
+        budget["area"] -= area
+        figure.embedded = True
+        if figure.cell is not None:
+            height = picture_size_cm(crop.shape, figure.box)[1]
+            cell_heights[figure.cell] = cell_heights.get(figure.cell, 0.4) + height + _PICTURE_SPACING_CM
+        return tag
+
+    html = _PLACEHOLDER.sub(replace, html)
+    # xhtml2pdf squeezes images into the fixed row height (and takes a row's
+    # height from its last cell), so every cell of a row holding pictures gets
+    # the height of its tallest picture cell.
+    row_heights: dict = {}
+    cell_rows = {f.cell: f.row for f in figures if f.cell is not None}
+    for cell, height in cell_heights.items():
+        row = cell_rows.get(cell)
+        if row is not None:
+            row_heights[row] = max(row_heights.get(row, 0.0), height)
+
+    def size_cell(match: re.Match) -> str:  # a cell outside any <tr>
+        height = cell_heights.get(int(match.group(1)))
+        if height is None or cell_rows.get(int(match.group(1))) is not None:
+            return ""
+        return f' style="height: {min(height, MAX_PICTURE_HEIGHT_CM + 1):.1f}cm"'
+
+    return _size_picture_rows(_CELL_MARK.sub(size_cell, html), row_heights)
+
+
+def _size_picture_rows(html: str, row_heights: dict) -> str:
+    """Gives the cells directly inside each marked <tr> its height; removes the marks."""
+    out, pos, rows = [], 0, []  # rows: one entry per open <tr> (its height or None)
+    for m in _ROW_TAGS.finditer(html):
+        closing, tag, attrs = m.groups()
+        out.append(html[pos:m.start()])
+        pos = m.end()
+        if tag == "tr" and closing:
+            if rows:
+                rows.pop()
+        elif tag == "tr":
+            mark = _ROW_MARK.search(attrs)
+            rows.append(row_heights.get(int(mark.group(1))) if mark else None)
+            attrs = _ROW_MARK.sub("", attrs)
+        elif not closing and rows and rows[-1]:
+            height = min(rows[-1], MAX_PICTURE_HEIGHT_CM + 1)
+            attrs = re.sub(r' style="[^"]*"', "", attrs) + f' style="height: {height:.1f}cm"'
+        out.append(f"<{closing}{tag}{attrs}>")
+    out.append(html[pos:])
+    return "".join(out)
 
 
 # ---------------------------------------------------------------------------
 # Cross-check
 # ---------------------------------------------------------------------------
 _BLOCK_END = re.compile(r"<(?:br\s*/?|/p|/h[1-6]|/div|/li|/tr)>", re.I)
+_BLOCK_START = re.compile(r"<(?:p|h[1-6]|div|li|tr|table|ul|ol)\b[^>]*>", re.I)
 _PAIR_SIMILARITY = 0.6  # lines this similar are shown side by side as one disagreement
 
 
@@ -246,6 +480,7 @@ def text_lines(html: str) -> List[str]:
     """Visible text of sanitized HTML, one entry per paragraph / heading / table row."""
     t = re.sub(r"</t[dh]>", " | ", html, flags=re.I)
     t = _BLOCK_END.sub("\n", t)
+    t = _BLOCK_START.sub("\n", t)  # also split text that sits outside any paragraph
     t = re.sub(r"<[^>]+>", "", t)
     t = html_lib.unescape(t)
     lines = []
@@ -287,7 +522,9 @@ def _align_block(a: List[str], b: List[str], na: List[str], nb: List[str]) -> Li
 
 
 def compare_readings(primary_html: str, secondary_html: str) -> List[LineDiff]:
-    a, b = text_lines(primary_html), text_lines(secondary_html)
+    # Pictures are cropped from the photo, not read, so their placeholders are not compared.
+    a = [x for x in text_lines(primary_html) if x != "[picture]"]
+    b = [x for x in text_lines(secondary_html) if x != "[picture]"]
     na, nb = [_comparable(x) for x in a], [_comparable(x) for x in b]
     diffs = []
     for tag, i1, i2, j1, j2 in SequenceMatcher(None, na, nb, autojunk=False).get_opcodes():
@@ -306,7 +543,9 @@ _ALLOWED_TAGS = {
 _VOID_TAGS = {"br"}
 _BLOCK_TAGS = {"h1", "h2", "h3", "p", "div", "table", "ul", "ol"}
 _DROP_CONTENT_TAGS = {"script", "style", "title", "iframe", "object", "math", "template"}
-_PICTURE_TAGS = {"img", "svg", "picture", "canvas"}
+_PICTURE_TAGS = {"img", "svg"}  # <picture>/<canvas> are wrappers: their <img> is the figure
+_YES = ("yes", "y", "true", "1", "ja")
+_NO = ("no", "n", "false", "0", "nein")
 _ALLOWED_CLASSES = {"num"}
 _DOT_RUN = re.compile(r"[.…]{2,}|…")
 # Symbols the built-in PDF fonts cannot draw (they would print as filled squares).
@@ -332,16 +571,66 @@ class _Sanitizer(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.out: List[str] = []
-        self.figures: List[str] = []
+        self.figures: List[Figure] = []
         self._open: List[str] = []
+        self._start_tags: List[Tuple[int, List[str]]] = []  # (index in out, attributes) per open tag
+        self._cells = 0  # table cells that hold a picture
+        self._rows = 0   # table rows that hold a picture
         self._skip_depth = 0
 
-    def _close_until(self, tag: str) -> None:
+    def _push(self, tag: str, kept: List[str]) -> None:
+        self.out.append(f"<{tag}{''.join(' ' + k for k in kept)}>")
+        self._open.append(tag)
+        self._start_tags.append((len(self.out) - 1, kept))
+
+    def _close_until(self, tag: str) -> List[Tuple[str, List[str]]]:
+        """Closes open elements up to and including `tag`; returns them, innermost first."""
+        closed = []
         while self._open:
             top = self._open.pop()
+            _, kept = self._start_tags.pop()
             self.out.append(f"</{top}>")
+            closed.append((top, kept))
             if top == tag:
-                return
+                break
+        return closed
+
+    def _add_picture(self, attrs) -> None:
+        values = dict(attrs)
+        flag = (values.get("data-handwriting") or "").strip().lower()
+        self.figures.append(Figure(
+            box=parse_box(values.get("data-box") or ""),
+            has_handwriting=True if flag in _YES else False if flag in _NO else None,
+        ))
+        # The placeholder is a block: end an open paragraph around it and reopen
+        # it (with its inline formatting) afterwards, as a browser would.
+        reopen = self._close_until("p") if "p" in self._open else []
+        # Only this module ever writes data-fig/data-cell/data-row; model attributes
+        # are never copied. embed_figures sizes the marked cells and rows to fit.
+        self.out.append(f'<p class="figure" data-fig="{len(self.figures) - 1}">[picture]</p>')
+        figure = self.figures[-1]
+        for tag, (index, kept) in zip(reversed(self._open), reversed(self._start_tags)):
+            if figure.cell is None and tag in ("td", "th"):
+                figure.cell = self._mark(tag, index, kept, "data-cell", "_cells", 'class="pic"')
+            elif figure.cell is not None and tag == "tr":
+                figure.row = self._mark(tag, index, kept, "data-row", "_rows")
+                break
+            elif tag == "table":
+                break
+        for tag, kept in reversed(reopen):
+            self._push(tag, list(kept))
+
+    def _mark(self, tag: str, index: int, kept: List[str], name: str, counter: str,
+              *extra: str) -> int:
+        """Adds (or reads) a numbered marker attribute on an already written start tag."""
+        mark = next((k for k in kept if k.startswith(f"{name}=")), None)
+        if mark is None:
+            number = getattr(self, counter)
+            setattr(self, counter, number + 1)
+            mark = f'{name}="{number}"'
+            kept.extend([*extra, mark])
+            self.out[index] = f"<{tag}{''.join(' ' + k for k in kept)}>"
+        return int(mark.split('"')[1])
 
     def _open_in_table(self, tag: str) -> bool:
         """Is `tag` open in the innermost table (not in a table around it)?"""
@@ -370,12 +659,7 @@ class _Sanitizer(HTMLParser):
         if self._skip_depth:
             return
         if tag in _PICTURE_TAGS:
-            box = dict(attrs).get("data-box") or ""
-            if re.fullmatch(r"\s*\d+(\s*,\s*\d+){3}\s*", box):
-                self.figures.append(box.replace(" ", ""))
-            else:
-                self.figures.append("")
-            self.out.append('<p class="figure">[picture]</p>')
+            self._add_picture(attrs)
             if tag == "svg":
                 self._skip_depth += 1  # its drawing content is not text
             return
@@ -390,9 +674,10 @@ class _Sanitizer(HTMLParser):
                 kept.append(f'{name}="{min(int(value), 20)}"')
             elif name == "class" and value in _ALLOWED_CLASSES:
                 kept.append(f'class="{value}"')
-        self.out.append(f"<{tag}{''.join(' ' + k for k in kept)}>")
-        if tag not in _VOID_TAGS:
-            self._open.append(tag)
+        if tag in _VOID_TAGS:
+            self.out.append(f"<{tag}>")
+        else:
+            self._push(tag, kept)
 
     def handle_startendtag(self, tag, attrs):
         if tag in _DROP_CONTENT_TAGS:
@@ -420,16 +705,23 @@ class _Sanitizer(HTMLParser):
     def finish(self) -> str:
         self.close()
         while self._open:
-            self.out.append(f"</{self._open.pop()}>")
-        return "".join(self.out)
+            self._close_until(self._open[-1])
+        html = "".join(self.out)
+        # Empty wrappers (e.g. left around a picture the model put in its own <p>)
+        # only add blank space; remove them, innermost first.
+        while True:
+            shorter = _EMPTY_INLINE.sub("", html)
+            if shorter == html:
+                return html
+            html = shorter
 
 
-def sanitize_html(raw_html: str) -> Tuple[str, List[str]]:
+def sanitize_html(raw_html: str) -> Tuple[str, List[Figure]]:
     """
     Keeps only simple formatting tags (no attributes except colspan/rowspan and
     the page-number class), drops scripts, styles, links and remote resources,
-    replaces pictures with a placeholder and closes every open tag.
-    Returns (html, picture boxes; "" for a picture without a box).
+    replaces pictures with a numbered placeholder and closes every open tag.
+    Returns (html, pictures in placeholder order).
     Raises ValueError for HTML the parser cannot handle.
     """
     s = _Sanitizer()
@@ -450,16 +742,19 @@ def _resource_policy():
     return ResourceAccessPolicy(allow_remote=False, base_dir=None, max_render_seconds=120)
 
 
-def render_pdf(pages_html: Sequence[str]) -> bytes:
+def render_pdf(pages_html: Sequence[str], compact: bool = False) -> bytes:
     """
     Renders sanitized page bodies as one A4 PDF, each worksheet on a new page.
-    Raises RuntimeError if rendering fails.
+    `compact` uses tighter spacing. Raises RuntimeError if rendering fails.
     """
     from xhtml2pdf import pisa  # heavy import, only needed here
 
+    css = PAGE_CSS
+    if compact:
+        css = css.replace(_PAGE_RULE, _COMPACT_PAGE_RULE) + COMPACT_CSS
     body = "<pdf:nextpage />".join(f"<div>{page}</div>" for page in pages_html)
     doc = (
-        f'<html><head><meta charset="utf-8"><style>{PAGE_CSS}</style></head>'
+        f'<html><head><meta charset="utf-8"><style>{css}</style></head>'
         f"<body>{body}</body></html>"
     )
     out = io.BytesIO()
@@ -470,6 +765,50 @@ def render_pdf(pages_html: Sequence[str]) -> bytes:
     if status.err:
         raise RuntimeError(f"PDF rendering failed ({status.err} error(s)).")
     return out.getvalue()
+
+
+def page_count(pdf: bytes) -> int:
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(pdf)
+    try:
+        return len(doc)
+    finally:
+        doc.close()
+
+
+def render_page(page_html: str) -> bytes:
+    """
+    Renders one worksheet. If it spills onto a second sheet (often just the page
+    number), it is rendered again with tighter spacing and the shorter result
+    is kept. Raises RuntimeError if rendering fails.
+    """
+    pdf = render_pdf([page_html])
+    if page_count(pdf) > 1:
+        compact = render_pdf([page_html], compact=True)
+        if page_count(compact) < page_count(pdf):
+            return compact
+    return pdf
+
+
+def merge_pdfs(pdfs: Sequence[bytes]) -> bytes:
+    """Joins already rendered PDFs, so one heavy page cannot fail the whole document."""
+    import pypdfium2 as pdfium
+
+    merged = pdfium.PdfDocument.new()
+    sources = []
+    try:
+        for data in pdfs:
+            source = pdfium.PdfDocument(data)
+            sources.append(source)
+            merged.import_pages(source)
+        out = io.BytesIO()
+        merged.save(out)
+        return out.getvalue()
+    finally:
+        for source in sources:
+            source.close()
+        merged.close()
 
 
 def render_preview(pdf_bytes: bytes, scale: float = 1.4) -> List[bytes]:
