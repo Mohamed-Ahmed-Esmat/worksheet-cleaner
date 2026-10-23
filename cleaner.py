@@ -1,8 +1,8 @@
 """
 Core image processing logic for Worksheet Cleaner.
 Supports:
-1. OpenRouter API: Calls Google Nano Banana Pro (google/gemini-3-pro-image)
-   and Nano Banana 2.1 via OpenRouter's global API to directly regenerate
+1. OpenRouter API: Calls Google Nano Banana 2.1 (default, ~4x cheaper) or
+   Nano Banana Pro via OpenRouter's global API to directly regenerate
    clean worksheet images without regional/country restrictions.
 2. Local OpenCV filter (Offline).
 """
@@ -15,6 +15,10 @@ import re
 import base64
 import requests
 from typing import List, Tuple, Optional
+
+# Default image model for page regeneration: image output costs ~$30/M tokens,
+# vs ~$120/M for Nano Banana Pro (google/gemini-3-pro-image).
+DEFAULT_REGEN_MODEL = "google/gemini-nano-banana-2.1"
 
 
 class WorksheetCleaner:
@@ -68,15 +72,15 @@ class WorksheetCleaner:
         custom_prompt: Optional[str] = None,
     ) -> Tuple[Optional[np.ndarray], str]:
         """
-        Sends the worksheet photo to OpenRouter to run Nano Banana Pro
-        (google/gemini-3-pro-image) and return the regenerated clean image.
+        Sends the worksheet photo to an OpenRouter image model (Nano Banana 2.1
+        by default) and returns the regenerated clean image.
         Uses pure HTTP requests (curl style).
         """
         if not api_key or not api_key.strip():
             return None, "Error: OpenRouter API key is missing. Please enter your key in the sidebar."
 
         # Model selection
-        model = chosen_model.strip() if chosen_model and chosen_model.strip() else "google/gemini-3-pro-image"
+        model = chosen_model.strip() if chosen_model and chosen_model.strip() else DEFAULT_REGEN_MODEL
 
         # Default prompt
         default_prompt = "Remove all handwritten pen answers from this image and return the clean questions only."
@@ -124,7 +128,7 @@ class WorksheetCleaner:
                 if "cannot be used with the chat/completions endpoint" in err_msg or "/api/v1/images endpoint instead" in err_msg:
                     return None, (
                         f"Model '{model}' is a Text-to-Image generation model (it only generates art from text prompts and cannot take photos as input).\n\n"
-                        "👉 To clean or regenerate a worksheet from a photo, choose an Image-to-Image model like 'google/gemini-3-pro-image' (Nano Banana Pro)."
+                        "👉 To clean or regenerate a worksheet from a photo, choose an Image-to-Image model like 'google/gemini-nano-banana-2.1' (Nano Banana 2.1)."
                     )
 
                 return None, f"OpenRouter API error ({resp.status_code}): {err_msg}"
@@ -142,7 +146,7 @@ class WorksheetCleaner:
                 msg_obj = choices[0].get("message", {})
                 content_val = msg_obj.get("content")
                 if content_val and isinstance(content_val, str) and content_val.strip():
-                    return None, f"Model '{model}' returned text instead of an image:\n\n\"{content_val.strip()[:250]}\"\n\n👉 This model is text/vision-only. For image-to-image worksheet regeneration, select 'google/gemini-3-pro-image' (Nano Banana Pro) or another image output model."
+                    return None, f"Model '{model}' returned text instead of an image:\n\n\"{content_val.strip()[:250]}\"\n\n👉 This model is text/vision-only. For image-to-image worksheet regeneration, select 'google/gemini-nano-banana-2.1' (Nano Banana 2.1) or another image output model."
                 snippet = str(msg_obj)[:300]
                 return None, f"Could not find image in model response from '{model}': {snippet}"
 
